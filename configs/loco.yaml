@@ -54,6 +54,15 @@ loss:
   target_norm: layernorm # layernorm | l2 | none  (applied to teacher outputs)
 
 masking:
+  # MEASURED, synthetic screw_board, 80 epochs, image AUROC:
+  #   random_patch 0.955 > small 0.927 > large 0.838 > multiscale 0.762
+  # The multi-scale hypothesis did NOT hold on this data -- see the README's
+  # ablation section for the likely cause (patch-count loss weighting lets the
+  # large blocks dominate the gradient). `multiscale` is kept as the default
+  # because it is the strategy under study; switch to `random_patch` if you
+  # want the best measured configuration, and re-run
+  # `run_ablations.py --study masking` on real MVTec LOCO before concluding
+  # anything, since these anomalies are small relative to a 5x5-8x8 block.
   strategy: multiscale   # random_patch | small | large | multiscale
   mode: mixed            # multiscale only: mixed | alternate | curriculum
   num_small_targets: 3        # multiscale: small blocks per step
