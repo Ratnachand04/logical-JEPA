@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Logical-JEPA — Industrial Anomaly Inspection</title>
+  <meta name="description" content="JEPA-based unsupervised detection and localization of logical anomalies in industrial images.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔍</text></svg>">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- ===================== HEADER ===================== -->
+<header class="site-header">
+  <div class="wrap header-inner">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="26" height="26">
+          <rect x="2"  y="2"  width="12" height="12" rx="2" class="sq a"/>
+          <rect x="18" y="2"  width="12" height="12" rx="2" class="sq b"/>
+          <rect x="2"  y="18" width="12" height="12" rx="2" class="sq b"/>
+          <rect x="18" y="18" width="12" height="12" rx="2" class="sq c"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1>Logical-JEPA</h1>
+        <p>Multi-scale contextual latent prediction for logical anomaly detection</p>
+      </div>
+    </div>
+
+    <div class="header-meta" id="header-meta">
+      <span class="chip chip-loading" id="status-chip">connecting…</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ===================== HOW IT WORKS ===================== -->
+  <section class="panel explainer" id="explainer">
+    <button class="explainer-toggle" id="explainer-toggle" aria-expanded="true" aria-controls="explainer-body">
+      <span>How the model decides</span>
+      <svg viewBox="0 0 16 16" width="14" height="14" class="chev"><path d="M3 6l5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+
+    <div class="explainer-body" id="explainer-body">
+      <div class="flow">
+        <div class="flow-step">
+          <span class="flow-num">1</span>
+          <h3>Hide a region</h3>
+          <p>A sliding window blanks one region of the patch grid. Every region takes its turn, so a defect can never hide inside the context.</p>
+        </div>
+        <div class="flow-arrow" aria-hidden="true">→</div>
+        <div class="flow-step">
+          <span class="flow-num">2</span>
+          <h3>Predict its latent</h3>
+          <p>The context encoder sees only the visible patches. The predictor imagines the embedding that <em>should</em> be in the hidden region.</p>
+        </div>
+        <div class="flow-arrow" aria-hidden="true">→</div>
+        <div class="flow-step">
+          <span class="flow-num">3</span>
+          <h3>Compare</h3>
+          <p>The EMA target encoder reports what is <em>actually</em> there. Cosine distance between the two is the anomaly score for that region.</p>
+        </div>
+        <div class="flow-arrow" aria-hidden="true">→</div>
+        <div class="flow-step">
+          <span class="flow-num">4</span>
+          <h3>Accumulate</h3>
+          <p>Errors from every window and every scale fuse into a 16×16 grid, then upsample to a full-resolution heatmap.</p>
+        </div>
+      </div>
+
+      <p class="explainer-note">
+        Trained only on normal images. A missing, extra, misplaced or miscounted component
+        produces a large discrepancy because the surrounding structure implies something else
+        belongs there — which is why this catches <strong>logical</strong> errors that a
+        texture-based detector cannot see.
+      </p>
+    </div>
+  </section>
+
+  <!-- ===================== INPUT ===================== -->
+  <section class="grid-2">
+
+    <div class="panel">
+      <h2 class="panel-title">Inspect an image</h2>
+
+      <div class="dropzone" id="dropzone" tabindex="0" role="button"
+           aria-label="Upload an image to inspect">
+        <input type="file" id="file-input" accept="image/*" hidden>
+        <svg viewBox="0 0 48 48" width="34" height="34" class="dz-icon" aria-hidden="true">
+          <path d="M24 32V12m0 0l-7 7m7-7l7 7" fill="none" stroke="currentColor"
+                stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M8 30v6a4 4 0 004 4h24a4 4 0 004-4v-6" fill="none" stroke="currentColor"
+                stroke-width="2.5" stroke-linecap="round"/>
+        </svg>
+        <p class="dz-main">Drop an image, or <span class="link">browse</span></p>
+        <p class="dz-sub">PNG / JPG · resized to 256×256 · max 16 MB</p>
+      </div>
+
+      <div class="run-row">
+        <button class="btn btn-primary" id="run-btn" disabled>
+          <span class="btn-label">Run inspection</span>
+        </button>
+        <button class="btn btn-ghost" id="clear-btn" disabled>Clear</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 class="panel-title">Or pick a test sample</h2>
+      <p class="panel-sub" id="samples-caption">Loading the test split…</p>
+      <div class="samples" id="samples"></div>
+    </div>
+
+  </section>
+
+  <!-- ===================== PROGRESS ===================== -->
+  <div class="progress-wrap" id="progress" hidden>
+    <div class="progress-bar"><span></span></div>
+    <p id="progress-text">Sweeping masks across the image…</p>
+  </div>
+
+  <!-- ===================== ERROR ===================== -->
+  <div class="alert" id="alert" hidden role="alert"></div>
+
+  <!-- ===================== RESULTS ===================== -->
+  <section id="results" hidden>
+
+    <div class="panel verdict-panel" id="verdict-panel">
+      <div class="verdict-main">
+        <div class="verdict-badge" id="verdict-badge">
+          <span class="verdict-word" id="verdict-word">—</span>
+          <span class="verdict-sub" id="verdict-sub"></span>
+        </div>
+
+        <div class="gauge-block">
+          <div class="gauge" id="gauge">
+            <div class="gauge-track">
+              <div class="gauge-fill" id="gauge-fill"></div>
+              <div class="gauge-threshold" id="gauge-threshold" title="decision threshold"></div>
+            </div>
+            <div class="gauge-labels">
+              <span>normal</span><span>threshold</span><span>anomalous</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <dl class="stats" id="stats"></dl>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">Localization</h2>
+        <div class="seg" id="view-seg" role="tablist" aria-label="Result view">
+          <button class="seg-btn is-active" data-view="overlay" role="tab" aria-selected="true">Overlay</button>
+          <button class="seg-btn" data-view="heatmap" role="tab" aria-selected="false">Heatmap</button>
+          <button class="seg-btn" data-view="input" role="tab" aria-selected="false">Input</button>
+          <button class="seg-btn" data-view="split" role="tab" aria-selected="false">Compare</button>
+        </div>
+      </div>
+
+      <div class="viewer" id="viewer">
+        <figure class="shot" id="shot-a">
+          <img id="img-a" alt="Inspected image">
+          <figcaption id="cap-a">Overlay</figcaption>
+        </figure>
+        <figure class="shot" id="shot-b" hidden>
+          <img id="img-b" alt="Anomaly heatmap">
+          <figcaption id="cap-b">Heatmap</figcaption>
+        </figure>
+      </div>
+
+      <div class="legend">
+        <span class="legend-label">low discrepancy</span>
+        <div class="legend-bar" aria-hidden="true"></div>
+        <span class="legend-label">high discrepancy</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 class="panel-title">Per-scale evidence</h2>
+      <p class="panel-sub">
+        Each sweep window asks a different question. Small windows notice local texture
+        faults; large windows notice that a whole component is wrong, missing or
+        duplicated. Comparing the columns tells you <em>which kind</em> of anomaly fired.
+      </p>
+      <div class="scales" id="scales"></div>
+    </div>
+
+  </section>
+
+  <!-- ===================== MODEL CARD ===================== -->
+  <section class="panel" id="modelcard">
+    <h2 class="panel-title">Model card</h2>
+    <div class="cardgrid" id="cardgrid"></div>
+    <p class="footnote" id="calib-note"></p>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <p>
+      <strong>Logical-JEPA</strong> — trained from scratch in PyTorch, no pretrained
+      backbone. Unsupervised: only normal images are ever used for training and calibration.
+    </p>
+  </div>
+</footer>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
