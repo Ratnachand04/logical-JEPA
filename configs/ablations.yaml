@@ -1,0 +1,158 @@
+# ===========================================================================
+# Ablation study definitions, consumed by run_ablations.py
+#
+# Inherits every default from loco.yaml; each arm below lists only the keys it
+# changes, so the arms differ in exactly one factor and nothing else.
+# ===========================================================================
+
+_base_: loco.yaml
+
+experiment:
+  name: ablation_study
+
+# Shorter schedule than the headline run: four masking arms plus the scoring
+# sweep is a lot of training, and the ranking between arms stabilises well
+# before the absolute numbers do.
+train:
+  epochs: 80
+  warmup_epochs: 8
+
+ablation:
+  # ---------------------------------------------------------------- #
+  # Study 1 -- masking strategy (requires training one model per arm)
+  #
+  # Hypothesis: small masks favour structural anomalies, large masks favour
+  # logical ones, and multi-scale beats both on the combined metric.
+  # ---------------------------------------------------------------- #
+  masking:
+    - name: exp1_random_patch
+      description: Scattered individual patches (MAE-style control)
+      overrides:
+        masking.strategy: random_patch
+        masking.mask_ratio: 0.20
+
+    - name: exp2_small_only
+      description: Small 2x2-3x3 blocks only
+      overrides:
+        masking.strategy: small
+        masking.num_small_only_targets: 6
+
+    - name: exp3_large_only
+      description: Large 5x5-8x8 blocks only
+      overrides:
+        masking.strategy: large
+        masking.num_large_only_targets: 2
+
+    - name: exp4_multiscale
+      description: Proposed multi-scale contextual masking
+      overrides:
+        masking.strategy: multiscale
+        masking.mode: mixed
+        masking.num_small_targets: 3
+        masking.num_large_targets: 1
+
+    - name: exp5_multiscale_curriculum
+      description: Multi-scale with a small-to-large curriculum
+      overrides:
+        masking.strategy: multiscale
+        masking.mode: curriculum
+
+  # ---------------------------------------------------------------- #
+  # Study 2 -- anomaly score function (inference only, no retraining)
+  #
+  # Method A/B/C from the project plan. These re-score an already-trained
+  # checkpoint, so the whole study costs one evaluation pass per row.
+  # ---------------------------------------------------------------- #
+  scoring:
+    - name: score_cosine
+      description: "Method B: 1 - cos(Zt, Zt_hat)"
+      overrides:
+        anomaly.distance: cosine
+
+    - name: score_l2
+      description: "Method A: ||Zt - Zt_hat||_2"
+      overrides:
+        anomaly.distance: l2
+
+    - name: score_combined_a07
+      description: "Method C: 0.7*cosine + 0.3*L2"
+      overrides:
+        anomaly.distance: combined
+        anomaly.alpha: 0.7
+
+    - name: score_combined_a05
+      description: "Method C: equal cosine/L2 mixture"
+      overrides:
+        anomaly.distance: combined
+        anomaly.alpha: 0.5
+
+    - name: score_smooth_l1
+      description: Huber distance in latent space
+      overrides:
+        anomaly.distance: smooth_l1
+
+  # ---------------------------------------------------------------- #
+  # Study 3 -- inference sweep configuration (inference only)
+  #
+  # Tests the claim that the *evaluation* scale matters independently of the
+  # training scale: a model trained multi-scale should still lose logical
+  # sensitivity if it is only swept with small windows.
+  # ---------------------------------------------------------------- #
+  sweep:
+    - name: sweep_small_only
+      description: Sweep with 2x2 windows only
+      overrides:
+        anomaly.sweep_windows: [2]
+
+    - name: sweep_large_only
+      description: Sweep with 6x6 windows only
+      overrides:
+        anomaly.sweep_windows: [6]
+
+    - name: sweep_multi
+      description: Multi-scale sweep (2, 4, 6)
+      overrides:
+        anomaly.sweep_windows: [2, 4, 6]
+
+    - name: sweep_multi_max
+      description: Multi-scale sweep fused with max instead of mean
+      overrides:
+        anomaly.sweep_windows: [2, 4, 6]
+        anomaly.fusion: max
+
+    - name: sweep_multi_weighted
+      description: Multi-scale sweep biased towards the logical (large) scale
+      overrides:
+        anomaly.sweep_windows: [2, 4, 6]
+        anomaly.fusion: weighted
+        anomaly.scale_weights: {2: 1.0, 4: 1.5, 6: 2.5}
+
+  # ---------------------------------------------------------------- #
+  # Study 4 -- grid normalisation (inference only)
+  #
+  # A genuine trade-off, not a tuning knob. `global` divides out the
+  # position-dependent baseline difficulty measured on normal images and is
+  # what makes image-level detection work. The per-image modes produce
+  # sharper localisation but destroy between-image comparability, so image
+  # AUROC collapses towards chance while pixel AUROC stays high. Report both.
+  # ---------------------------------------------------------------- #
+  normalization:
+    - name: norm_global
+      description: Per-position statistics fitted on normal images (proposed)
+      overrides:
+        anomaly.normalize: global
+
+    - name: norm_zscore
+      description: Per-image z-score (sharp localisation, weak image detection)
+      overrides:
+        anomaly.normalize: zscore
+
+    - name: norm_median
+      description: Per-image median/MAD, robust to a few extreme patches
+      overrides:
+        anomaly.normalize: median
+
+    - name: norm_none
+      description: Raw error, no normalisation at all
+      overrides:
+        anomaly.normalize: none
