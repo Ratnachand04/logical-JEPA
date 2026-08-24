@@ -1,0 +1,113 @@
+# ===========================================================================
+# Logical-JEPA -- default configuration for MVTec LOCO AD
+#
+# Override any value from the command line with dotted keys, e.g.
+#   py -3.12 train.py --config configs/loco.yaml --set train.epochs=200 masking.strategy=large
+# ===========================================================================
+
+experiment:
+  name: logical_jepa_multiscale
+  seed: 42
+  deterministic: false
+  output_dir: outputs
+  checkpoint_dir: checkpoints
+
+data:
+  # Point this at the unpacked MVTec LOCO AD archive. The synthetic stand-in
+  # produced by scripts/download_data.py --synthetic lives here too.
+  root: data/mvtec_loco
+  category: screw_board
+  img_size: 256          # 256 / 16 = a 16x16 patch grid = 256 tokens
+  patch_size: 16
+  num_workers: 4
+  # Augmentation is intentionally minimal: anything that moves, removes or
+  # duplicates content would teach the model that logical anomalies are normal.
+  augment: true
+
+encoder:
+  embed_dim: 256
+  depth: 6
+  num_heads: 8
+  mlp_ratio: 4.0
+  qkv_bias: true
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.05
+
+predictor:
+  # Narrower and shallower than the encoder on purpose: the semantic work must
+  # happen in the encoder, and a weak predictor cannot memorise the dataset.
+  predictor_dim: 192
+  depth: 3
+  num_heads: 8
+  mlp_ratio: 4.0
+  drop_path_rate: 0.0
+
+ema:
+  base_momentum: 0.996
+  final_momentum: 1.0    # cosine-annealed towards 1.0 over training
+
+loss:
+  kind: cosine           # cosine | l2 | l1 | smooth_l1 | combined
+  alpha: 0.7             # cosine weight when kind=combined
+  beta: 1.0              # smooth_l1 transition point
+  target_norm: layernorm # layernorm | l2 | none  (applied to teacher outputs)
+
+masking:
+  strategy: multiscale   # random_patch | small | large | multiscale
+  mode: mixed            # multiscale only: mixed | alternate | curriculum
+  num_small_targets: 3        # multiscale: small blocks per step
+  num_large_targets: 1        # multiscale: large blocks per step
+  num_small_only_targets: 6   # strategy=small: blocks per step
+  num_large_only_targets: 2   # strategy=large: blocks per step
+  small_sizes: [[2, 2], [2, 3], [3, 2], [3, 3]]
+  large_sizes: [[5, 5], [6, 6], [5, 7], [7, 5], [8, 8]]
+  p_small: 0.5
+  mask_ratio: 0.20       # random_patch only
+  max_overlap: 0.3
+  max_masked_ratio: 0.6
+
+train:
+  epochs: 150
+  batch_size: 16
+  lr: 0.001
+  min_lr: 0.000001
+  weight_decay: 0.04
+  final_weight_decay: 0.4   # AdamW wd is annealed up, as in I-JEPA
+  warmup_epochs: 15
+  grad_clip: 3.0
+  amp: true                 # bf16/fp16 autocast on CUDA
+  log_interval: 20
+  save_interval: 25
+  masks_per_batch: 1        # independent mask draws per batch of images
+
+eval:
+  batch_size: 8
+  calibrate_on: validation  # validation | train  -- NORMAL images only
+  sigma_threshold: 3.0      # threshold = mean + k*std of normal scores
+
+anomaly:
+  # Inference-time mask sweep. Windows mirror the training scales: small
+  # windows localise structural defects, large windows expose logical ones.
+  sweep_windows: [2, 4, 6]
+  sweep_strides: null       # null -> max(1, window // 2), i.e. 50% overlap
+  sweep_chunk: 16           # sweep positions per forward pass; lower if OOM
+
+  fusion: mean              # mean | max | weighted | product
+  # global -> per-scale statistics fitted on NORMAL images. Do not use the
+  # per-image modes (zscore/minmax/median) for image-level detection: they
+  # force every map to the same mean and std, which erases the between-image
+  # difference the image score measures.
+  normalize: global         # global | zscore | minmax | median | none
+  scale_weights: null       # {2: 1.0, 4: 1.0, 6: 2.0} when fusion=weighted
+  smooth_sigma: 4.0
+
+  aggregation: topk         # topk | max | mean
+  top_k_ratio: 0.01
+  distance: null            # null -> reuse loss.kind
+  alpha: null
+
+visualize:
+  num_samples: 8
+  colormap: jet
+  overlay_alpha: 0.5
