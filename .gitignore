@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# Logical-JEPA — repository ignore rules
+# ---------------------------------------------------------------------------
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Virtual environments (this project intentionally uses the GLOBAL Python 3.12
+# interpreter — no venv should ever be created or committed here)
+venv/
+.venv/
+env/
+ENV/
+
+# Datasets — MVTec LOCO AD must be downloaded by the user, never committed
+data/mvtec_loco/
+data/**/*.png
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.tif
+data/**/*.tiff
+data/**/*.zip
+data/**/*.tar
+data/**/*.tar.gz
+!data/.gitkeep
+
+# Model weights / training artefacts
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Experiment outputs
+outputs/
+runs/
+logs/
+*.log
+results/*.json
+results/*.csv
+
+# Frontend upload scratch space
+app/uploads/
+app/static/generated/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
