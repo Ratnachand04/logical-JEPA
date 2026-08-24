@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------------
+# Logical-JEPA requirements
+#
+# IMPORTANT: this project is developed against the GLOBAL Python 3.12
+# interpreter. Do NOT create a virtual environment. Install with:
+#
+#   py -3.12 -m pip install -r requirements.txt
+#
+# For CUDA builds of torch/torchvision use the official index, e.g.:
+#   py -3.12 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# ---------------------------------------------------------------------------
+
+torch>=2.4
+torchvision>=0.19
+
+numpy>=1.26
+scipy>=1.11
+scikit-learn>=1.4
+
+opencv-python>=4.9
+pillow>=10.0
+tifffile>=2024.1
+
+matplotlib>=3.8
+seaborn>=0.13
+
+pyyaml>=6.0
+tqdm>=4.66
+
+# Frontend / inference server
+flask>=3.0
+flask-cors>=4.0
