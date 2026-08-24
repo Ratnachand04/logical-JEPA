@@ -1,0 +1,3 @@
+# Datasets are downloaded or generated, never committed.
+# MVTec LOCO AD:  py -3.12 scripts/download_data.py
+# Synthetic dev:  py -3.12 scripts/download_data.py --synthetic
