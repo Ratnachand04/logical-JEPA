@@ -1,0 +1,188 @@
+"""Evaluate a trained Logical-JEPA checkpoint on MVTec LOCO AD.
+
+Reports image-level AUROC/AP, pixel-level AUROC and AU-PRO, each broken out
+**separately for logical and structural anomalies** -- a single averaged number
+would hide the effect this project exists to measure.
+
+The decision threshold is fitted on held-out *normal* images only, so the
+pipeline stays unsupervised end to end.
+
+Usage::
+
+    py -3.12 evaluate.py --checkpoint checkpoints/logical_jepa_multiscale/screw_board/final.pt
+    py -3.12 evaluate.py --checkpoint <path> --set anomaly.distance=l2 anomaly.fusion=max
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+
+import numpy as np
+import torch
+
+from anomaly.metrics import evaluate_split, summarize
+from anomaly.scoring import build_scorer
+from datasets.mvtec_loco import build_dataloaders, build_normal_loader
+from masking import SweepMaskBank
+from models import build_model
+from utils.config import Config, deep_merge, load_config
+from utils.logging_utils import get_logger, save_json
+from utils.seed import seed_everything
+
+
+def load_model_from_checkpoint(path: str, device, cfg_override: Config | None = None):
+    """Restore a model plus the config it was trained with.
+
+    The architecture always comes from the checkpoint -- overrides may change
+    *inference* settings (sweep windows, distance, fusion) but never the layer
+    shapes, which would fail to load.
+    """
+    payload = torch.load(path, map_location=device, weights_only=False)
+    cfg = Config(payload["config"])
+
+    if cfg_override:
+        cfg = deep_merge(cfg, cfg_override)
+
+    model = build_model(cfg).to(device)
+    model.load_state_dict(payload["model"])
+    model.eval()
+
+    return model, cfg, payload
+
+
+def build_sweep_bank(cfg, model, device) -> SweepMaskBank:
+    return SweepMaskBank(
+        grid_size=model.grid_size,
+        windows=cfg.get_path("anomaly.sweep_windows", [2, 4, 6]),
+        strides=cfg.get_path("anomaly.sweep_strides", None),
+        device=device,
+    )
+
+
+@torch.no_grad()
+def evaluate(cfg, checkpoint: str, logger, save_arrays: bool = False) -> dict:
+    """Score the test split and compute the full metric report."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(cfg.get_path("experiment.seed", 42))
+
+    model, cfg, payload = load_model_from_checkpoint(checkpoint, device, cfg)
+    category = cfg.get_path("data.category")
+    logger.info(f"Loaded {checkpoint} (epoch {payload.get('epoch', '?')})")
+    logger.info(model.describe())
+
+    train_loader, val_loader, test_loader = build_dataloaders(cfg, category)
+    logger.info(f"Test set: {test_loader.dataset.counts()}")
+
+    bank = build_sweep_bank(cfg, model, device)
+    scorer = build_scorer(cfg, model, bank)
+    logger.info(f"Sweep: {bank.describe()}")
+    logger.info(
+        f"Scoring: distance={scorer.distance or model.loss_kind} fusion={scorer.fusion} "
+        f"aggregation={scorer.aggregation}"
+    )
+
+    # ---- calibration on NORMAL images only --------------------------- #
+    calib_loader = val_loader if (
+        cfg.get_path("eval.calibrate_on", "validation") == "validation" and val_loader
+    ) else train_loader
+    stats_loader = build_normal_loader(cfg, category, "train")
+
+    # The positional statistics are a per-patch mean and std, so they are fitted
+    # on the (much larger) normal training set; the threshold stays on the
+    # held-out validation normals. Both are anomaly-free.
+    calib = scorer.calibrate(
+        calib_loader, device,
+        sigma_threshold=cfg.get_path("eval.sigma_threshold", 3.0),
+        stats_loader=stats_loader,
+    )
+    logger.info(
+        f"Calibrated threshold on {calib.n_samples} normal images "
+        f"(positional stats from {len(stats_loader.dataset)} train normals): "
+        f"mean={calib.score_mean:.4f} std={calib.score_std:.4f} threshold={calib.threshold:.4f}"
+    )
+
+    # ---- score the test split ---------------------------------------- #
+    out = scorer.score_loader(test_loader, device, collect_maps=True, progress=True)
+
+    results = evaluate_split(
+        scores=out["scores"],
+        labels=out["labels"],
+        defect_types=out["defect_types"],
+        maps=out.get("maps"),
+        masks=out.get("masks"),
+    )
+
+    # Threshold-dependent operating point, for the demo's verdict.
+    predicted = calib.is_anomalous(out["scores"])
+    truth = out["labels"] == 1
+    results["accuracy_at_threshold"] = float((predicted == truth).mean())
+    results["tpr_at_threshold"] = float(predicted[truth].mean()) if truth.any() else float("nan")
+    results["fpr_at_threshold"] = float(predicted[~truth].mean()) if (~truth).any() else float("nan")
+    results["threshold"] = calib.threshold
+    results["category"] = category
+    results["checkpoint"] = checkpoint
+    results["masking_strategy"] = cfg.get_path("masking.strategy")
+    results["distance"] = scorer.distance or model.loss_kind
+    results["sweep_windows"] = list(bank.scales())
+    results["fusion"] = scorer.fusion
+
+    logger.info("\n" + summarize(results, f"{category} -- {cfg.get_path('experiment.name')}"))
+    logger.info(
+        f"  operating point: acc={results['accuracy_at_threshold']:.4f} "
+        f"TPR={results['tpr_at_threshold']:.4f} FPR={results['fpr_at_threshold']:.4f}"
+    )
+
+    # ---- persist ----------------------------------------------------- #
+    out_dir = os.path.join(cfg.get_path("experiment.output_dir", "outputs"),
+                           cfg.get_path("experiment.name", "run"), category)
+    os.makedirs(out_dir, exist_ok=True)
+
+    save_json({"results": results, "calibration": calib.to_dict()},
+              os.path.join(out_dir, "eval_results.json"))
+
+    # The calibration lives beside the checkpoint so the web demo can load a
+    # threshold without re-running evaluation.
+    save_json(calib.to_dict(),
+              os.path.join(os.path.dirname(checkpoint), "calibration.json"))
+
+    if save_arrays:
+        np.savez_compressed(
+            os.path.join(out_dir, "scores.npz"),
+            scores=out["scores"], labels=out["labels"], defect_types=out["defect_types"],
+        )
+        logger.info(f"Saved raw scores to {out_dir}/scores.npz")
+
+    return results
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a Logical-JEPA checkpoint")
+    parser.add_argument("--checkpoint", required=True, help="path to a .pt checkpoint")
+    parser.add_argument("--config", default=None,
+                        help="optional config whose inference settings override the checkpoint's")
+    parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                        help="dotted overrides, e.g. anomaly.distance=l2")
+    parser.add_argument("--save-arrays", action="store_true",
+                        help="also dump raw per-image scores as .npz")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.config:
+        cfg = load_config(args.config, args.set)
+    else:
+        cfg = Config()
+        for item in args.set:
+            key, _, value = item.partition("=")
+            import yaml
+            cfg.set_path(key.strip(), yaml.safe_load(value.strip()))
+
+    logger = get_logger("evaluate")
+    evaluate(cfg, args.checkpoint, logger, save_arrays=args.save_arrays)
+
+
+if __name__ == "__main__":
+    main()
