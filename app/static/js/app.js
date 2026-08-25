@@ -45,6 +45,8 @@ const el = {
   scales:       $('scales'),
   cardgrid:     $('cardgrid'),
   calibNote:    $('calib-note'),
+
+  sweepGrid:    $('sweep-grid'),
 };
 
 const state = {
@@ -54,6 +56,8 @@ const state = {
   lastResult:   null,
   view:         'overlay',
   busy:         false,
+  sweepTimer:   null,
+  elapsedTimer: null,
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -80,11 +84,97 @@ function clearAlert() {
   el.alert.hidden = true;
 }
 
+/** Remove + reflow + re-add a class so a CSS animation replays on re-run. */
+function retrigger(node, cls) {
+  if (!node) return;
+  node.classList.remove(cls);
+  // eslint-disable-next-line no-unused-expressions
+  void node.offsetWidth;
+  node.classList.add(cls);
+}
+
+/** Animate a number counting from its previous shown value to `target`. */
+function animateNumber(node, target, { decimals = 4, prefix = '', suffix = '', duration = 700 } = {}) {
+  const from = Number(node.dataset.value || 0);
+  const start = performance.now();
+
+  function tick(now) {
+    const t = Math.min(1, (now - start) / duration);
+    const eased = 1 - Math.pow(1 - t, 3);              // ease-out-cubic
+    const value = from + (target - from) * eased;
+    node.textContent = `${prefix}${value.toFixed(decimals)}${suffix}`;
+    if (t < 1) requestAnimationFrame(tick);
+    else node.dataset.value = String(target);
+  }
+  requestAnimationFrame(tick);
+}
+
 function setBusy(busy, message) {
   state.busy = busy;
   el.progress.hidden = !busy;
   if (message) el.progressText.textContent = message;
   el.runBtn.disabled = busy || (!state.pendingFile && state.activeSample === null);
+  el.runBtn.classList.toggle('is-busy', busy);
+
+  const label = el.runBtn.querySelector('.btn-label');
+  if (busy) {
+    label.innerHTML = '<span class="spinner"></span>Inspecting…';
+    startSweepAnimation();
+  } else {
+    label.textContent = 'Run inspection';
+    stopSweepAnimation();
+  }
+}
+
+/* Lights random cells of the 16x16 grid and cycles status copy while the
+   real request is in flight, so the wait itself explains the mechanism
+   (a window sweeping over every region of the patch grid) instead of being
+   dead time. */
+const SWEEP_MESSAGES = [
+  'Sweeping masks across the patch grid…',
+  'Predicting hidden-region embeddings…',
+  'Comparing predicted vs observed latents…',
+  'Fusing evidence across scales…',
+];
+
+function startSweepAnimation() {
+  if (!el.sweepGrid) return;
+
+  if (!el.sweepGrid.childElementCount) {
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < 256; i++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      frag.appendChild(cell);
+    }
+    el.sweepGrid.appendChild(frag);
+  }
+
+  const cells = el.sweepGrid.children;
+  let msgIndex = 0;
+  let tick = 0;
+
+  state.sweepTimer = setInterval(() => {
+    for (const c of cells) c.classList.remove('lit');
+    for (let i = 0; i < 10; i++) {
+      cells[Math.floor(Math.random() * cells.length)].classList.add('lit');
+    }
+    tick++;
+    if (tick % 6 === 0) {
+      msgIndex = (msgIndex + 1) % SWEEP_MESSAGES.length;
+      el.progressText.textContent = SWEEP_MESSAGES[msgIndex];
+    }
+  }, 140);
+}
+
+function stopSweepAnimation() {
+  if (state.sweepTimer) {
+    clearInterval(state.sweepTimer);
+    state.sweepTimer = null;
+  }
+  if (el.sweepGrid) {
+    for (const c of el.sweepGrid.children) c.classList.remove('lit');
+  }
 }
 
 /* --------------------------------------------------------------- explainer */
@@ -92,7 +182,7 @@ function setBusy(busy, message) {
 el.explToggle.addEventListener('click', () => {
   const open = el.explToggle.getAttribute('aria-expanded') === 'true';
   el.explToggle.setAttribute('aria-expanded', String(!open));
-  el.explBody.hidden = open;
+  el.explBody.classList.toggle('is-collapsed', open);
 });
 
 /* ------------------------------------------------------------------ status */
@@ -387,8 +477,9 @@ async function predict() {
 
 function renderResult(r) {
   // --- verdict -------------------------------------------------------- //
-  el.verdictBadge.classList.toggle('is-anom', r.is_anomalous);
-  el.verdictBadge.classList.toggle('is-normal', !r.is_anomalous);
+  el.verdictBadge.classList.remove('is-anom', 'is-normal');
+  void el.verdictBadge.offsetWidth;                 // reflow so the animation replays
+  el.verdictBadge.classList.add(r.is_anomalous ? 'is-anom' : 'is-normal');
   el.verdictWord.textContent = r.verdict;
 
   if (!r.calibrated) {
@@ -405,31 +496,52 @@ function renderResult(r) {
   // units of the normal-score standard deviation, clamped to the visible span.
   const span = 6;                                  // ±6σ maps to the full bar
   const pos = 50 + (r.z_score / span) * 50;
-  el.gaugeFill.style.width = `${Math.max(2, Math.min(100, pos))}%`;
+  el.gaugeFill.style.width = '0%';
+  // Force the browser to register the 0% start before animating to the real
+  // width, otherwise the transition has no starting point to animate from.
+  void el.gaugeFill.offsetWidth;
+  requestAnimationFrame(() => {
+    el.gaugeFill.style.width = `${Math.max(2, Math.min(100, pos))}%`;
+  });
+  retrigger(el.gaugeFill, 'gauge-fill');
   el.gaugeThresh.style.left = '50%';
 
   // --- stats ---------------------------------------------------------- //
-  const stats = [
-    ['Anomaly score', r.score.toFixed(4), 'top-1% of the heatmap'],
-    ['Deviation', `${r.z_score >= 0 ? '+' : ''}${r.z_score.toFixed(2)}σ`, 'vs normal images'],
-    ['Threshold', r.threshold.toFixed(4), 'mean + 3σ of normals'],
-    ['Peak location', `${r.peak.x}, ${r.peak.y}`, 'x, y in pixels'],
-    ['Inference', `${r.elapsed_ms} ms`, 'full mask sweep'],
+  const statDefs = [
+    { k: 'Anomaly score', value: r.score, decimals: 4, note: 'top-1% of the heatmap' },
+    { k: 'Deviation', value: r.z_score, decimals: 2, suffix: 'σ',
+      prefix: r.z_score >= 0 ? '+' : '', note: 'vs normal images' },
+    { k: 'Threshold', value: r.threshold, decimals: 4, note: 'mean + 3σ of normals' },
+    { k: 'Peak location', text: `${r.peak.x}, ${r.peak.y}`, note: 'x, y in pixels' },
+    { k: 'Inference', text: `${r.elapsed_ms} ms`, note: 'full mask sweep' },
   ];
 
   el.stats.innerHTML = '';
-  for (const [k, v, note] of stats) {
+  for (const def of statDefs) {
     const wrap = document.createElement('div');
     const dt = document.createElement('dt');
     const dd = document.createElement('dd');
-    dt.textContent = k;
-    dd.textContent = v;
-    if (note) {
+    dt.textContent = def.k;
+
+    if (def.text !== undefined) {
+      dd.textContent = def.text;
+    } else {
+      const numSpan = document.createElement('span');
+      numSpan.dataset.value = '0';
+      numSpan.textContent = '0';
+      dd.appendChild(numSpan);
+      animateNumber(numSpan, def.value, {
+        decimals: def.decimals, prefix: def.prefix || '', suffix: def.suffix || '',
+      });
+    }
+
+    if (def.note) {
       const small = document.createElement('small');
-      small.textContent = ` ${note}`;
+      small.textContent = ` ${def.note}`;
       dd.appendChild(document.createElement('br'));
       dd.appendChild(small);
     }
+
     wrap.append(dt, dd);
     el.stats.appendChild(wrap);
   }
@@ -443,9 +555,11 @@ function applyView() {
   if (!r) return;
 
   const v = state.view;
+  retrigger(el.shotA, 'anim-in');
 
   if (v === 'split') {
     el.shotB.hidden = false;
+    retrigger(el.shotB, 'anim-in');
     el.imgA.src = r.images.input;    el.capA.textContent = 'Input';
     el.imgB.src = r.images.overlay;  el.capB.textContent = 'Anomaly overlay';
   } else {
