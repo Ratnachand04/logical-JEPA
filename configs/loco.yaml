@@ -84,6 +84,19 @@ masking:
   max_overlap: 0.3
   max_masked_ratio: 0.6
 
+regularizer:
+  # VICReg collapse safety net (Phase 3d). Off by default: the 3-sigma of
+  # measured results in the README were produced without it, and these terms
+  # fight the JEPA objective -- the predictive loss *wants* structured,
+  # correlated embeddings, which is exactly what the covariance term removes.
+  # Enable it for long schedules, keep the weights low, and watch `target_std`
+  # and `dead_dim_frac` in the logs as the regulariser's own unit test.
+  vicreg:
+    enabled: false
+    var_weight: 1.0      # hinge each dimension's batch std up to `gamma`
+    cov_weight: 0.04     # decorrelate dimensions; small on purpose
+    gamma: 1.0           # variance floor
+
 train:
   epochs: 150
   batch_size: 16
