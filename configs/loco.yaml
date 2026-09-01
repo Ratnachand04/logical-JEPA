@@ -150,5 +150,5 @@ anomaly:
 
 visualize:
   num_samples: 8
-  colormap: jet
+  colormap: inferno   # perceptually uniform and monotonic; do not change to a custom gradient
   overlay_alpha: 0.5
