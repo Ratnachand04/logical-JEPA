@@ -100,8 +100,9 @@ def jepa_loss(
     kind: str = "cosine",
     alpha: float = 0.7,
     beta: float = 1.0,
+    reduction: str = "per_patch",
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Mean prediction error over every target patch of every block.
+    """Mean prediction error over the target blocks.
 
     Blocks are weighted by their patch count rather than averaged
     block-by-block. This matters for the multi-scale strategy: a 6x6 block holds
@@ -113,31 +114,60 @@ def jepa_loss(
         target_blocks: list of (B, K_m, D) teacher embeddings.
         kind: distance name, see :data:`DISTANCES`.
         alpha, beta: parameters of ``combined`` / ``smooth_l1``.
+        reduction: how blocks are combined.
+
+            ``per_patch`` (default, preserves the historical behaviour)
+                Every target patch contributes equally, so a block's influence
+                scales with its area.
+            ``per_block``
+                Average within each block first, then across blocks, so every
+                block counts once regardless of size.
+
+            This choice is not cosmetic. Under ``per_patch`` a single 6x6 block
+            (36 patches) outweighs three 2x2-3x3 blocks (~19 patches combined)
+            by roughly 2:1, which means the ``multiscale`` masking strategy
+            effectively trains on its large-scale objective alone -- the leading
+            explanation for that arm losing Study 1. ``per_block`` is the
+            controlled test of that explanation.
 
     Returns:
         ``(loss, stats)`` where ``stats`` holds detached diagnostics -- notably
         ``cos_sim``, which should climb towards 1 as training converges, and is
-        the quickest way to spot representation collapse.
+        the quickest way to spot representation collapse. ``stats`` also
+        reports ``loss_small`` / ``loss_large`` when block sizes differ, so a
+        scale whose term has stalled is visible during training instead of only
+        in the final metrics.
     """
     if not pred_blocks:
         raise ValueError("jepa_loss received no target blocks")
+    if reduction not in ("per_patch", "per_block"):
+        raise ValueError(
+            f"Unknown loss reduction '{reduction}'. Use 'per_patch' or 'per_block'."
+        )
 
     total = pred_blocks[0].new_zeros(())
     n_patches = 0
     cos_accum = pred_blocks[0].new_zeros(())
+    block_means: list[torch.Tensor] = []
+    block_sizes: list[int] = []
 
     for pred, target in zip(pred_blocks, target_blocks):
         dist = patch_distance(pred, target, kind=kind, alpha=alpha, beta=beta)
-        count = dist.numel()
         total = total + dist.sum()
-        n_patches += count
+        n_patches += dist.numel()
+
+        block_means.append(dist.mean())
+        block_sizes.append(pred.size(1))
 
         with torch.no_grad():
             cos_accum = cos_accum + F.cosine_similarity(
                 pred.detach(), target.detach(), dim=-1
             ).sum()
 
-    loss = total / max(n_patches, 1)
+    if reduction == "per_block":
+        loss = torch.stack(block_means).mean()
+    else:
+        loss = total / max(n_patches, 1)
 
     with torch.no_grad():
         # Variance of the teacher embeddings across the batch. If this collapses
@@ -150,6 +180,16 @@ def jepa_loss(
             "cos_sim": float(cos_accum / max(n_patches, 1)),
             "target_std": float(target_std),
             "n_target_patches": n_patches,
+            "reduction": reduction,
         }
+
+        # Per-scale breakdown, so a stalled scale is visible in the logs.
+        # 9 patches is the largest "small" block (3x3) in the default config.
+        small = [m for m, s in zip(block_means, block_sizes) if s <= 9]
+        large = [m for m, s in zip(block_means, block_sizes) if s > 9]
+        if small:
+            stats["loss_small"] = float(torch.stack(small).mean())
+        if large:
+            stats["loss_large"] = float(torch.stack(large).mean())
 
     return loss, stats
