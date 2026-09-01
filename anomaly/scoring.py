@@ -183,6 +183,7 @@ class AnomalyScorer:
         out_size: int = 256,
         fusion: str = "mean",
         normalize: str = "global",
+        normalize_localization: str | None = None,
         sigma: float = 4.0,
         weights: dict[int, float] | None = None,
         aggregation: str = "topk",
@@ -195,7 +196,11 @@ class AnomalyScorer:
         self.mask_bank = mask_bank
         self.out_size = out_size
         self.fusion = fusion
+        # `normalize` remains the detection setting so older callers and saved
+        # configs keep working; localisation defaults to it unless overridden.
         self.normalize = normalize
+        self.normalize_detection = normalize
+        self.normalize_localization = normalize_localization or normalize
         self.sigma = sigma
         self.weights = weights
         self.aggregation = aggregation
@@ -220,14 +225,31 @@ class AnomalyScorer:
             images, self.mask_bank, chunk=self.chunk,
             distance=self.distance, alpha=self.alpha,
         )
-        maps = build_anomaly_map(
-            grids, out_size=self.out_size, fusion=self.fusion,
-            weights=self.weights, normalize=self.normalize, sigma=self.sigma,
-            scale_stats=self.calibration.scale_stats,
-        )
-        scores = aggregate_score(maps, self.aggregation, self.top_k_ratio)
 
-        out = {"scores": scores, "maps": maps}
+        def _maps(normalize: str) -> torch.Tensor:
+            return build_anomaly_map(
+                grids, out_size=self.out_size, fusion=self.fusion,
+                weights=self.weights, normalize=normalize, sigma=self.sigma,
+                scale_stats=self.calibration.scale_stats,
+            )
+
+        # Study 4 measured that no single normalisation is best at both jobs,
+        # so the two are computed separately rather than compromised into one.
+        detection_maps = _maps(self.normalize_detection)
+        scores = aggregate_score(detection_maps, self.aggregation, self.top_k_ratio)
+
+        if self.normalize_localization == self.normalize_detection:
+            localization_maps = detection_maps          # skip the duplicate work
+        else:
+            localization_maps = _maps(self.normalize_localization)
+
+        out = {
+            "scores": scores,
+            # `maps` stays the detection map so existing callers are unchanged.
+            "maps": detection_maps,
+            "detection_maps": detection_maps,
+            "localization_maps": localization_maps,
+        }
         if return_grids:
             out["grids"] = grids
         return out
@@ -245,7 +267,7 @@ class AnomalyScorer:
             from tqdm import tqdm
             iterator = tqdm(loader, desc="scoring", leave=False)
 
-        scores, labels, defects, maps, masks = [], [], [], [], []
+        scores, labels, defects, maps, loc_maps, masks = [], [], [], [], [], []
 
         for batch in iterator:
             images = batch["image"].to(device, non_blocking=True)
@@ -256,7 +278,8 @@ class AnomalyScorer:
             defects.extend(batch["defect_type"])
 
             if collect_maps:
-                maps.append(out["maps"].float().cpu().numpy())
+                maps.append(out["detection_maps"].float().cpu().numpy())
+                loc_maps.append(out["localization_maps"].float().cpu().numpy())
                 if "mask" in batch:
                     masks.append(batch["mask"].float().cpu().numpy())
 
@@ -267,6 +290,7 @@ class AnomalyScorer:
         }
         if collect_maps and maps:
             result["maps"] = np.concatenate(maps)
+            result["localization_maps"] = np.concatenate(loc_maps)
             if masks:
                 result["masks"] = np.concatenate(masks)
 
@@ -387,7 +411,8 @@ def build_scorer(cfg, model, mask_bank) -> AnomalyScorer:
         mask_bank=mask_bank,
         out_size=cfg.get_path("data.img_size", 256),
         fusion=node.get("fusion", "mean"),
-        normalize=node.get("normalize", "global"),
+        normalize=node.get("normalize_detection", node.get("normalize", "global")),
+        normalize_localization=node.get("normalize_localization", None),
         sigma=node.get("smooth_sigma", 4.0),
         weights=weights,
         aggregation=node.get("aggregation", "topk"),
