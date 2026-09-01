@@ -336,7 +336,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/ablations.yaml")
     parser.add_argument("--study", default="all",
                         choices=["all", "masking", "scoring", "sweep",
-                                 "normalization", "loss_reduction", "baselines"])
+                                 "normalization", "loss_reduction", "vicreg",
+                                 "baselines"])
     parser.add_argument("--checkpoint", default=None,
                         help="checkpoint for the inference-only studies and PatchCore; "
                              "defaults to the multi-scale masking arm's checkpoint")
@@ -369,7 +370,7 @@ def main() -> None:
     logger.info(f"Seeds: {seeds}" + ("" if len(seeds) > 1 else
                                      "  (single seed -- results will be labelled as such)"))
 
-    studies = (["masking", "loss_reduction", "scoring", "sweep",
+    studies = (["masking", "loss_reduction", "vicreg", "scoring", "sweep",
                 "normalization", "baselines"]
                if args.study == "all" else [args.study])
     all_rows: dict[str, list[dict]] = {}
@@ -383,6 +384,15 @@ def main() -> None:
         all_rows["Study 1: masking strategy"] = run_masking_study(
             cfg, arms, logger, out_dir, csv_path,
             retrain=not args.no_retrain, seeds=seeds,
+        )
+
+    if "vicreg" in studies:
+        # Trains one model per arm, like Studies 1 and 5.
+        arms = cfg.get_path("ablation.vicreg", [])
+        csv_path = os.path.join(out_dir, "vicreg_study.csv")
+        all_rows["Study 6: VICReg collapse regulariser"] = run_masking_study(
+            cfg, arms, logger, out_dir, csv_path,
+            retrain=not args.no_retrain, seeds=seeds, prefix="vicreg",
         )
 
     if "loss_reduction" in studies:
