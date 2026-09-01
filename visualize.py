@@ -34,6 +34,50 @@ import matplotlib
 matplotlib.use("Agg")   # headless: write files, never open a window
 
 import matplotlib.pyplot as plt
+
+# Deep-space chrome for every figure. This styles backgrounds, text and series
+# colours only -- data colormaps stay perceptually uniform (see below), because
+# a defect map is a measurement surface, not decoration.
+_STYLE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "utils", "galaxy.mplstyle")
+if os.path.isfile(_STYLE):
+    plt.style.use(_STYLE)
+
+# Perceptually uniform and monotonic. Do not replace with a custom gradient:
+# a non-monotonic colormap makes a heatmap actively misleading, and these
+# figures must also survive being printed in greyscale.
+ANOMALY_CMAP = "inferno"
+
+# Colormaps whose lightness is monotone, so "brighter" always means "higher".
+UNIFORM_CMAPS = {
+    "inferno", "magma", "viridis", "plasma", "cividis",
+    "gray", "grey", "Greys", "hot", "afmhot", "copper", "bone", "pink",
+}
+
+
+def resolve_anomaly_cmap(requested: str | None) -> str:
+    """Force the anomaly colormap to a perceptually uniform one.
+
+    This overrides the config on purpose. `jet` and friends are non-monotonic in
+    lightness: a mid-range value can render brighter than a high one, so a
+    reader misjudges *where* the defect is. That makes it a correctness problem
+    on a measurement surface, not a matter of taste, and it is the one place the
+    theme is allowed to overrule a saved setting.
+
+    Older checkpoints carry `visualize.colormap: jet` from before this rule
+    existed, which is exactly the case this guard is here to catch.
+    """
+    if requested and requested in UNIFORM_CMAPS:
+        return requested
+    if requested and requested not in UNIFORM_CMAPS:
+        import warnings
+
+        warnings.warn(
+            f"colormap '{requested}' is not perceptually uniform and would "
+            f"misrepresent the anomaly map; using '{ANOMALY_CMAP}' instead.",
+            stacklevel=2,
+        )
+    return ANOMALY_CMAP
 import numpy as np
 import torch
 
@@ -48,7 +92,7 @@ from utils.logging_utils import get_logger
 
 
 def _overlay(image: np.ndarray, heat: np.ndarray, alpha: float = 0.5,
-             cmap: str = "jet") -> np.ndarray:
+             cmap: str = ANOMALY_CMAP) -> np.ndarray:
     """Blend a normalised heatmap over an RGB image."""
     lo, hi = float(heat.min()), float(heat.max())
     norm = (heat - lo) / max(hi - lo, 1e-6)
@@ -70,7 +114,7 @@ def _pick_samples(dataset: MVTecLOCO, num: int, defect: str | None) -> list[int]
 
 # --------------------------------------------------------------------------- #
 def visualize_grid(model, scorer, dataset, indices, out_path, device,
-                   alpha=0.5, cmap="jet") -> str:
+                   alpha=0.5, cmap=ANOMALY_CMAP) -> str:
     """Input / heatmap / overlay / GT / per-scale panels for each sample."""
     scales = list(scorer.mask_bank.scales())
     n_cols = 4 + len(scales)
@@ -104,9 +148,15 @@ def visualize_grid(model, scorer, dataset, indices, out_path, device,
 
         for col, (data, title, cm) in enumerate(panels):
             ax = axes[row, col]
-            ax.imshow(data, cmap=cm) if cm else ax.imshow(data)
+            im = ax.imshow(data, cmap=cm) if cm else ax.imshow(data)
             ax.set_title(title, fontsize=8)
             ax.axis("off")
+            # The heatmap column carries a colorbar with real units, so a
+            # reader can tell a hot map from a merely rescaled one.
+            if cm == cmap and col == 1:
+                cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+                cbar.ax.tick_params(labelsize=6)
+                cbar.outline.set_edgecolor("#161E38")
 
     fig.suptitle(
         f"Logical-JEPA -- {dataset.category}  "
@@ -376,6 +426,11 @@ def parse_args() -> argparse.Namespace:
                         help="restrict to good / logical_anomalies / structural_anomalies")
     parser.add_argument("--num", type=int, default=6, help="samples to draw")
     parser.add_argument("--out", default=None, help="output directory")
+    parser.add_argument("--config", default=None,
+                        help="config whose inference settings override the "
+                             "checkpoint's (matches evaluate.py). Without it, an "
+                             "older checkpoint keeps whatever settings it was "
+                             "trained under.")
     parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE")
     return parser.parse_args()
 
@@ -385,11 +440,15 @@ def main() -> None:
     logger = get_logger("visualize")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    override = Config()
-    for item in args.set:
-        import yaml
-        key, _, value = item.partition("=")
-        override.set_path(key.strip(), yaml.safe_load(value.strip()))
+    if args.config:
+        from utils.config import load_config
+        override = load_config(args.config, args.set)
+    else:
+        override = Config()
+        for item in args.set:
+            import yaml
+            key, _, value = item.partition("=")
+            override.set_path(key.strip(), yaml.safe_load(value.strip()))
 
     model, cfg, _ = load_model_from_checkpoint(args.checkpoint, device, override)
     category = cfg.get_path("data.category")
@@ -448,7 +507,7 @@ def main() -> None:
                 os.path.join(out_dir, f"anomaly_maps_{args.defect or 'mixed'}.png"),
                 device,
                 alpha=cfg.get_path("visualize.overlay_alpha", 0.5),
-                cmap=cfg.get_path("visualize.colormap", "jet"),
+                cmap=resolve_anomaly_cmap(cfg.get_path("visualize.colormap", None)),
             )
             logger.info(f"wrote {path}")
 
