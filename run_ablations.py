@@ -337,7 +337,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--study", default="all",
                         choices=["all", "masking", "scoring", "sweep",
                                  "normalization", "loss_reduction", "vicreg",
-                                 "baselines"])
+                                 "deviation", "baselines"])
     parser.add_argument("--checkpoint", default=None,
                         help="checkpoint for the inference-only studies and PatchCore; "
                              "defaults to the multi-scale masking arm's checkpoint")
@@ -371,7 +371,7 @@ def main() -> None:
                                      "  (single seed -- results will be labelled as such)"))
 
     studies = (["masking", "loss_reduction", "vicreg", "scoring", "sweep",
-                "normalization", "baselines"]
+                "normalization", "deviation", "baselines"]
                if args.study == "all" else [args.study])
     all_rows: dict[str, list[dict]] = {}
 
@@ -424,7 +424,8 @@ def main() -> None:
     else:
         for study, title in (("scoring", "Study 2: anomaly score function"),
                              ("sweep", "Study 3: inference sweep configuration"),
-                             ("normalization", "Study 4: grid normalisation")):
+                             ("normalization", "Study 4: grid normalisation"),
+                             ("deviation", "Study 7: signed vs absolute deviation")):
             if study in studies:
                 arms = cfg.get_path(f"ablation.{study}", [])
                 csv_path = os.path.join(out_dir, f"{study}_study.csv")
