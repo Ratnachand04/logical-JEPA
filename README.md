@@ -59,15 +59,18 @@ the **anomaly score**. Nothing else changes.
 
 ## Results
 
-Everything below was produced by `run_ablations.py` on the built-in synthetic `screw_board`
-category (200 normal training images; 85 test images = 25 normal + 30 logical + 30
-structural), 80 epochs per arm, single seed.
+Two result sets, kept separate because they are not interchangeable:
 
-> **Read these as pipeline validation, not as benchmark numbers.** MVTec LOCO AD requires
-> manual registration and cannot be downloaded non-interactively, so the real benchmark was
-> not run here. Anything reported in a paper must be regenerated on it — see
-> [Dataset](#dataset). The synthetic anomalies are also *small* relative to the largest mask
-> scale, which matters for one of the findings below.
+- **Synthetic `screw_board`** (200 normal train, 85 test), 80 epochs, **single seed** — the
+  sections below. These validated the pipeline and produced the design decisions.
+- **Real MVTec LOCO AD** — see [`outputs/phase1/SUMMARY.md`](outputs/phase1/SUMMARY.md) for
+  the multi-seed re-run and whether the synthetic ordering reproduced.
+
+> **The synthetic numbers below are single-seed and are labelled as such throughout.** A
+> single-seed AUROC on a small test split carries enough spread to reorder ablation arms by
+> itself, which is why multi-seed reporting (`--seeds 0,1,2`, `mean ± std`) was added and why
+> the real-data study uses it. The synthetic anomalies are also *small* relative to the
+> largest mask scale, which matters for one of the findings below.
 
 ### Logical-JEPA vs baselines
 
@@ -337,14 +340,45 @@ anomalous image ever informs the threshold.
 
 ### MVTec LOCO AD (required for reported results)
 
-3,644 images across five categories, designed specifically to contain both structural and
-logical anomalies. Free for non-commercial research, but served behind a registration form,
-so it cannot be downloaded automatically:
+3,651 images across five categories, designed specifically to contain both structural and
+logical anomalies. Free for non-commercial research.
 
 ```bash
-py -3.12 scripts/download_data.py            # prints download instructions
-py -3.12 scripts/download_data.py --verify   # check an existing install
+py -3.12 scripts/download_data.py            # download instructions
+py -3.12 scripts/verify_dataset.py --root data/mvtec_loco_real --strict-loco
 ```
+
+`verify_dataset.py` is the strict check: it fails loudly on a missing split, an anomalous
+image with no ground-truth directory, ground truth stored as a flat file instead of a
+directory, an all-zero mask union, or **any anomaly found inside `train/` or `validation/`**
+— the last being the one that would silently invalidate the unsupervised claim.
+
+**Pre-resize before training.** LOCO ships images up to 1700×1000, and decoding them costs
+**84 ms each**, which makes training CPU-bound rather than GPU-bound:
+
+```bash
+py -3.12 scripts/prepare_loco.py --src data/mvtec_loco_real --dst data/mvtec_loco_256
+```
+
+This drops loading to **7.2 ms/image (11.7× faster)** and the dataset to 476 MB. It is not an
+approximation — the loader would have produced the same 256×256 tensor anyway. Masks are
+resampled with NEAREST, which reproduces LOCO's original label values exactly (they are *not*
+`{0,255}`; they carry values in the 234–255 range, and the loader thresholds at `> 0`).
+
+**Why the union of region masks matters.** Measured across the real dataset:
+
+| | images |
+|---|---:|
+| 1 region | 906 |
+| 2 regions | 65 |
+| 3 regions | 10 |
+| **15 regions** | 12 |
+
+**8.8% of annotated images carry multiple regions — and 50 of 91 `pushpins` logical
+anomalies do, up to 15 each.** A loader reading only the first mask file would silently lose
+over half the annotation on that category, with no error and no obviously wrong output. This
+is why `tests/test_union_mask.py` exists and why it is the most heavily tested path in the
+repository.
 
 Expected layout:
 
@@ -384,6 +418,30 @@ or screw pixel, and only the arrangement is invalid. That is precisely the regim
 project targets.
 
 ---
+
+## Tests
+
+```bash
+py -3.12 -m pytest tests/ -q          # 245 tests, ~14 s
+```
+
+| file | tests | what it guards |
+|---|---:|---|
+| `test_masking.py` | 42 | context/target disjointness, sweep coverage, scale semantics |
+| `test_scoring.py` | 34 | normalization trade-off, **calibration sees no anomaly** |
+| `test_model.py` | 33 | **no pretrained weights**, teacher detachment, EMA arithmetic |
+| `test_aggregate.py` | 27 | multi-seed stats, refusing to rank inside the noise |
+| `test_vicreg.py` | 26 | both collapse modes, the vanishing-gradient limit |
+| `test_dataset.py` | 23 | **train/validation stay anomaly-free**, transform policy |
+| `test_metrics.py` | 17 | AUROC endpoints, AU-PRO region weighting |
+| `test_union_mask.py` | 16 | **union of region masks** — the highest-risk data path |
+| `test_loss_reduction.py` | 14 | per-patch vs per-block arithmetic |
+| `test_decoupled_norm.py` | 13 | detection and localization paths stay separate |
+
+The bolded rows encode project *constraints* rather than ordinary correctness. They exist so
+a future change cannot quietly invalidate a research claim — a leaked anomaly in the
+calibration set or a pretrained backbone would not otherwise raise an error, it would just
+make every reported number optimistic.
 
 ## Repository layout
 
