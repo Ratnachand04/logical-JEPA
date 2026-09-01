@@ -30,6 +30,7 @@ from .context_encoder import ContextEncoder, build_context_encoder
 from .patch_embed import gather_tokens
 from .predictor import JEPAPredictor, build_predictor
 from .target_encoder import TargetEncoder, normalize_targets
+from .vicreg import build_vicreg, collapse_report, vicreg_loss
 
 
 class LogicalJEPA(nn.Module):
@@ -49,6 +50,7 @@ class LogicalJEPA(nn.Module):
         predictor_cfg: dict | None = None,
         loss_cfg: dict | None = None,
         ema_cfg: dict | None = None,
+        regularizer_cfg: dict | None = None,
     ):
         super().__init__()
         encoder_cfg = dict(encoder_cfg or {})
@@ -79,6 +81,10 @@ class LogicalJEPA(nn.Module):
         # per_patch (default) weights blocks by area; per_block gives every
         # block equal say regardless of size -- see anomaly.embedding_error.
         self.loss_reduction = loss_cfg.get("reduction", "per_patch")
+
+        # Optional collapse regulariser. None when disabled, so the term costs
+        # nothing rather than being multiplied by a zero weight.
+        self.vicreg = build_vicreg(regularizer_cfg)
 
     # ------------------------------------------------------------------ #
     # Training
@@ -123,6 +129,16 @@ class LogicalJEPA(nn.Module):
             kind=self.loss_kind, alpha=self.loss_alpha, beta=self.loss_beta,
             reduction=self.loss_reduction,
         )
+        # 4. Optional VICReg safety net, applied to the *predicted* embeddings.
+        #    Applying it to the teacher would be pointless: the teacher receives
+        #    no gradient, so nothing there can be regularised.
+        if self.vicreg is not None:
+            flat = torch.cat([p.reshape(-1, p.size(-1)) for p in preds], dim=0)
+            reg_loss, reg_stats = vicreg_loss(flat, **self.vicreg)
+            loss = loss + reg_loss
+            stats.update(reg_stats)
+            stats.update(collapse_report(flat, gamma=self.vicreg["gamma"]))
+
         stats["masked_ratio"] = spec.num_target_patches / self.num_patches
         stats["num_blocks"] = spec.num_targets
         return loss, stats
@@ -282,4 +298,5 @@ def build_model(cfg) -> LogicalJEPA:
         predictor_cfg=cfg.get("predictor", {}),
         loss_cfg=cfg.get("loss", {}),
         ema_cfg=cfg.get("ema", {}),
+        regularizer_cfg=cfg.get("regularizer", {}),
     )
