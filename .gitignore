@@ -23,7 +23,11 @@ env/
 ENV/
 
 # Datasets — MVTec LOCO AD must be downloaded by the user, never committed
+# MVTec LOCO AD is licensed by MVTec: ignore any extracted copy wholesale,
+# including its readme / licence / defects_config sidecar files.
 data/mvtec_loco/
+data/mvtec_loco_real/
+data/mvtec_loco*/
 data/**/*.png
 data/**/*.jpg
 data/**/*.jpeg
