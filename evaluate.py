@@ -105,13 +105,34 @@ def evaluate(cfg, checkpoint: str, logger, save_arrays: bool = False) -> dict:
     # ---- score the test split ---------------------------------------- #
     out = scorer.score_loader(test_loader, device, collect_maps=True, progress=True)
 
+    # Detection metrics come from the detection-normalised maps; localisation
+    # metrics from the localisation-normalised ones. Study 4 showed no single
+    # normalisation is best at both, so they are never mixed into one number.
     results = evaluate_split(
         scores=out["scores"],
         labels=out["labels"],
         defect_types=out["defect_types"],
-        maps=out.get("maps"),
+        maps=out.get("localization_maps", out.get("maps")),
         masks=out.get("masks"),
     )
+    results["normalize_detection"] = scorer.normalize_detection
+    results["normalize_localization"] = scorer.normalize_localization
+
+    # When the two differ, also report what localisation *would* have been under
+    # the detection normalisation, so the trade-off is visible in one place
+    # rather than requiring a second run to see.
+    if (scorer.normalize_localization != scorer.normalize_detection
+            and out.get("masks") is not None and out.get("maps") is not None):
+        anomalous = out["labels"] == 1
+        if anomalous.any():
+            from anomaly.metrics import compute_pro as _pro
+            from anomaly.metrics import pixel_auroc as _px
+            results["pixel_auroc_under_detection_norm"] = _px(
+                out["maps"][anomalous], out["masks"][anomalous]
+            )
+            results["au_pro_under_detection_norm"] = _pro(
+                out["maps"][anomalous], out["masks"][anomalous]
+            )
 
     # Threshold-dependent operating point, for the demo's verdict.
     predicted = calib.is_anomalous(out["scores"])
