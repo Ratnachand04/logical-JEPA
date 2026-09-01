@@ -114,6 +114,7 @@ def fuse_scales(
     weights: dict[int, float] | None = None,
     normalize: str = "global",
     scale_stats: dict[int, tuple[float, float]] | None = None,
+    deviation: str = "signed",
 ) -> torch.Tensor:
     """Combine per-scale grids into one. ``{w: (B, H, W)} -> (B, H, W)``.
 
@@ -128,21 +129,47 @@ def fuse_scales(
         normalize: per-scale normalisation applied before fusion.
         scale_stats: ``{window: (mean, std)}`` fitted on normal images, required
             by ``normalize='global'``.
+        deviation: how a normalised grid is turned into "surprise".
+
+            ``signed`` (default)
+                Only *harder than normal* counts. This is the classic
+                assumption: an anomaly is something the model cannot predict.
+            ``absolute``
+                ``|z|`` -- both harder *and easier* than normal count.
+
+            The second mode exists because of a measured failure. On real LOCO
+            ``pushpins``, logical AUROC came out at 0.449 +/- 0.003 -- reliably
+            *below chance*, meaning anomalous images were scoring systematically
+            lower than normal ones. The mechanism: a **missing** component leaves
+            an empty region, and empty regions are *easier* to predict than the
+            object that belongs there. Signed scoring reads that as "extra
+            normal" and pushes the image down the ranking.
+
+            ``absolute`` treats an unexpectedly-easy region as equally
+            suspicious, which is the right prior when the anomaly class includes
+            missing objects.
     """
     if not grids:
         raise ValueError("fuse_scales received no grids")
 
+    if deviation not in ("signed", "absolute"):
+        raise ValueError(
+            f"Unknown deviation mode '{deviation}'. Use 'signed' or 'absolute'."
+        )
+
     scales = sorted(grids.keys())
-    stack = torch.stack(
-        [
-            normalize_grid(
-                grids[w], normalize,
-                stats=(scale_stats or {}).get(w),
-            )
-            for w in scales
-        ],
-        dim=0,
-    )
+    normalised = [
+        normalize_grid(grids[w], normalize, stats=(scale_stats or {}).get(w))
+        for w in scales
+    ]
+
+    if deviation == "absolute":
+        # Applied per scale, before fusion: a scale that is unexpectedly easy
+        # must register as surprise in its own right, not be averaged away
+        # against another scale that happens to be hard.
+        normalised = [n.abs() for n in normalised]
+
+    stack = torch.stack(normalised, dim=0)
 
     if mode == "mean":
         return stack.mean(dim=0)
@@ -213,11 +240,12 @@ def build_anomaly_map(
     normalize: str = "global",
     sigma: float = 4.0,
     scale_stats: dict[int, tuple[float, float]] | None = None,
+    deviation: str = "signed",
 ) -> torch.Tensor:
     """Full grid-to-heatmap pipeline. Returns (B, 1, out_size, out_size)."""
     fused = fuse_scales(
         grids, mode=fusion, weights=weights,
-        normalize=normalize, scale_stats=scale_stats,
+        normalize=normalize, scale_stats=scale_stats, deviation=deviation,
     )
     return upsample_map(fused, out_size=out_size, sigma=sigma)
 
