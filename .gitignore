@@ -32,6 +32,9 @@ data/**/*.tiff
 data/**/*.zip
 data/**/*.tar
 data/**/*.tar.gz
+data/**/*.tar.xz
+data/**/*.xz
+data/_download/
 !data/.gitkeep
 
 # Model weights / training artefacts
