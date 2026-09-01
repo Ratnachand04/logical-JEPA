@@ -218,10 +218,11 @@ class MVTecLOCO(Dataset):
 
         if self.return_mask:
             mask_img = load_union_mask(sample.mask_dir, original_size)
-            mask = self.mask_transform(mask_img)
-            item["mask"] = (torch.as_tensor(np.array(mask)) > 0).float().reshape(
-                1, self.img_size, self.img_size
-            )
+            # The transform already returns a uint8 tensor, so binarise it
+            # directly; round-tripping through numpy trips a deprecation warning
+            # on torchvision tv_tensors and copies for no reason.
+            mask = torch.as_tensor(self.mask_transform(mask_img))
+            item["mask"] = (mask > 0).float().reshape(1, self.img_size, self.img_size)
 
         return item
 
