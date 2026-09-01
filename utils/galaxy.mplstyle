@@ -1,0 +1,83 @@
+# ===========================================================================
+# Logical-JEPA figure style -- deep space / observatory console
+#
+# Applies to `visualize.py` figures only. This file sets *chrome* -- background,
+# text, gridlines, series colours. It deliberately does NOT set `image.cmap`:
+# anomaly maps must stay on a perceptually uniform, monotonic colormap
+# (inferno / magma / viridis), because a defect map is a measurement surface and
+# a non-monotonic gradient makes it actively misleading. Series colours are
+# chosen to remain distinguishable in greyscale, since these figures end up
+# printed in a paper.
+# ===========================================================================
+
+# ---- canvas ---------------------------------------------------------------
+figure.facecolor:      05070F
+figure.edgecolor:      05070F
+axes.facecolor:        0B1020
+savefig.facecolor:     05070F
+savefig.edgecolor:     05070F
+savefig.bbox:          tight
+savefig.dpi:           150
+figure.dpi:            110
+
+# ---- text -----------------------------------------------------------------
+text.color:            E8ECF8
+axes.labelcolor:       8B96B8
+axes.titlecolor:       E8ECF8
+xtick.color:           8B96B8
+ytick.color:           8B96B8
+
+font.family:           sans-serif
+font.sans-serif:       Inter, Segoe UI, DejaVu Sans, Arial, sans-serif
+font.size:             9.0
+axes.titlesize:        10.0
+axes.titleweight:      semibold
+axes.labelsize:        9.0
+legend.fontsize:       8.0
+xtick.labelsize:       8.0
+ytick.labelsize:       8.0
+figure.titlesize:      12.0
+figure.titleweight:    semibold
+
+# ---- axes and grid --------------------------------------------------------
+axes.edgecolor:        161E38
+axes.linewidth:        0.8
+axes.grid:             True
+axes.axisbelow:        True
+grid.color:            161E38
+grid.linestyle:        -
+grid.linewidth:        0.6
+grid.alpha:            0.55
+
+axes.spines.top:       False
+axes.spines.right:     False
+
+xtick.direction:       out
+ytick.direction:       out
+xtick.major.size:      3.0
+ytick.major.size:      3.0
+xtick.major.width:     0.7
+ytick.major.width:     0.7
+
+# ---- series colours -------------------------------------------------------
+# plasma cyan, nebula violet, solar amber, red giant, then two supporting
+# tones. Ordered so the first three stay separable in greyscale by luminance.
+axes.prop_cycle: cycler('color', ['35D6E8', '8B6BF0', 'FFB547', 'FF5B6E', '5EE6A8', 'B8C2E0'])
+
+lines.linewidth:       1.4
+lines.markersize:      4.0
+patch.edgecolor:       161E38
+patch.linewidth:       0.6
+hatch.color:           8B96B8
+
+# ---- legend ---------------------------------------------------------------
+legend.facecolor:      0B1020
+legend.edgecolor:      161E38
+legend.framealpha:     0.92
+legend.borderpad:      0.5
+
+# ---- images ---------------------------------------------------------------
+# Interpolation off by default: anomaly grids are 16x16 measurements and
+# smoothing them in the renderer would imply resolution the model does not have.
+image.interpolation:   nearest
+image.origin:          upper
