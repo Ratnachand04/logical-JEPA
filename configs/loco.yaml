@@ -52,6 +52,14 @@ loss:
   alpha: 0.7             # cosine weight when kind=combined
   beta: 1.0              # smooth_l1 transition point
   target_norm: layernorm # layernorm | l2 | none  (applied to teacher outputs)
+  # How target blocks are combined into one scalar.
+  #   per_patch  every patch counts equally, so a block's weight scales
+  #              with its area (one 6x6 block outweighs three 3x3 ones ~2:1)
+  #   per_block  average within a block first, then across blocks
+  # Default is per_patch to preserve the behaviour every measured result
+  # in the README was produced under. Study 5 tests whether per_block
+  # rescues the multiscale masking arm.
+  reduction: per_patch   # per_patch | per_block
 
 masking:
   # MEASURED, synthetic screw_board, 80 epochs, image AUROC:
@@ -108,6 +116,17 @@ anomaly:
   # force every map to the same mean and std, which erases the between-image
   # difference the image score measures.
   normalize: global         # global | zscore | minmax | median | none
+
+  # Detection and localisation want DIFFERENT normalisations (Study 4).
+  #   detection    -> `global`: per-position statistics fitted on normal images.
+  #                   Keeps between-image differences, so the image score works.
+  #   localisation -> `zscore`: per-image standardisation. Sharper heatmaps, but
+  #                   image AUROC collapses towards chance if used for scoring.
+  # Measured on synthetic screw_board: global gives image 0.762 / pixel 0.615;
+  # zscore gives image 0.461 / pixel 0.876. There is no setting that wins both,
+  # so both are computed and reported separately -- never averaged together.
+  normalize_detection: global      # drives the NORMAL / ANOMALOUS verdict
+  normalize_localization: zscore   # drives the operator-facing heatmap
   scale_weights: null       # {2: 1.0, 4: 1.0, 6: 2.0} when fusion=weighted
   smooth_sigma: 4.0
 
