@@ -62,15 +62,19 @@ loss:
   reduction: per_patch   # per_patch | per_block
 
 masking:
-  # MEASURED, synthetic screw_board, 80 epochs, image AUROC:
-  #   random_patch 0.955 > small 0.927 > large 0.838 > multiscale 0.762
-  # The multi-scale hypothesis did NOT hold on this data -- see the README's
-  # ablation section for the likely cause (patch-count loss weighting lets the
-  # large blocks dominate the gradient). `multiscale` is kept as the default
-  # because it is the strategy under study; switch to `random_patch` if you
-  # want the best measured configuration, and re-run
-  # `run_ablations.py --study masking` on real MVTec LOCO before concluding
-  # anything, since these anomalies are small relative to a 5x5-8x8 block.
+  # MEASURED on real MVTec LOCO pushpins, 80 epochs, 3 seeds, image AUROC:
+  #   multiscale+curriculum 0.645 +/- 0.007
+  #   multiscale            0.641 +/- 0.005
+  #   large                 0.638 +/- 0.004
+  #   small                 0.638 +/- 0.003
+  #   random_patch          0.632 +/- 0.007
+  # All five arms sit within 0.013 of each other against a seed sigma of ~0.005,
+  # i.e. the masking strategy has NO measurable effect on real data.
+  #
+  # An earlier single-seed run on the synthetic screw_board showed a 0.193
+  # spread with multiscale worst. That did NOT reproduce and has been retracted
+  # -- see outputs/phase1/SUMMARY.md. Do not reinstate it without multi-seed
+  # evidence on the real benchmark.
   strategy: multiscale   # random_patch | small | large | multiscale
   mode: mixed            # multiscale only: mixed | alternate | curriculum
   num_small_targets: 3        # multiscale: small blocks per step
