@@ -97,7 +97,13 @@ PatchCore is weak here for the reason its module documents: a memory bank of pat
 has no notion of *where* a patch was or *how many* like it there were. Note its absolute
 numbers are not comparable to published PatchCore results — see [Baselines](#baselines).
 
-### Study 1 · Masking strategy — the hypothesis did **not** hold
+### Study 1 · Masking strategy — RETRACTED on real data
+
+> ⚠️ **This synthetic result did not reproduce.** It is kept here because the
+> retraction is the more useful finding. See
+> [`outputs/phase1/SUMMARY.md`](outputs/phase1/SUMMARY.md).
+
+Synthetic `screw_board`, **single seed**:
 
 | Arm | Image AUROC | Logical | Structural | Pixel AUROC | AU-PRO |
 |---|---|---|---|---|---|
@@ -107,34 +113,53 @@ numbers are not comparable to published PatchCore results — see [Baselines](#b
 | `multiscale` (proposed) | 0.762 | 0.783 | 0.741 | 0.615 | 0.497 |
 | `multiscale` + curriculum | 0.805 | 0.764 | 0.845 | 0.502 | 0.501 |
 
-The predicted ordering was multi-scale > single-scale, with large blocks carrying logical
-performance. **The measured ordering is the reverse:** finer masking wins on every metric,
-and the proposed multi-scale strategy is the weakest arm.
+On this data the ordering looked decisive — a 0.193 spread, with multi-scale worst — and the
+project previously concluded that "finer masking wins" and "multi-scale masking is
+unsupported".
 
-Two things are worth separating here.
+Real MVTec LOCO `pushpins`, 80 epochs, **3 seeds**, `mean ± std`:
 
-*What did hold:* large-block masking has markedly worse localization (pixel AUROC 0.589,
-AU-PRO 0.548) than small-block masking (0.898 / 0.697). An 8×8 target produces one error
-value for a 128×128 pixel region, so the coarse-localization prediction was correct.
+| Arm | Image AUROC | Logical | Structural |
+|---|---|---|---|
+| `random_patch` | 0.632 ± 0.007 | 0.449 ± 0.003 | 0.837 ± 0.012 |
+| `small` | 0.638 ± 0.003 | 0.448 ± 0.001 | 0.851 ± 0.005 |
+| `large` | 0.638 ± 0.004 | 0.454 ± 0.004 | 0.845 ± 0.006 |
+| `multiscale` | 0.641 ± 0.005 | 0.451 ± 0.003 | 0.855 ± 0.008 |
+| `multiscale` + curriculum | **0.645 ± 0.007** | 0.453 ± 0.005 | **0.860 ± 0.010** |
 
-*Why the rest probably failed —* two candidate causes, both testable:
+**Every arm falls within 0.013 image AUROC**, against a seed σ of ~0.005 — the runner's own
+significance check reports the top two as `indistinguishable (0.6σ)`. The ordering is even
+mildly *reversed*, with `multiscale + curriculum` leading.
 
-1. **Loss weighting makes "multi-scale" effectively large-dominated.** `jepa_loss` weights
-   target patches equally, so one 6×6 block (36 patches) outweighs three small blocks
-   (~19 patches combined) roughly 2:1. The multi-scale arm therefore trains mostly on the
-   large-scale objective — which is why its numbers sit close to `large`, not between the two
-   arms. Averaging per *block* instead of per *patch* is the obvious next experiment.
-2. **The synthetic anomalies are too small for the large scale to help.** A missing screw
-   spans roughly 3×3 patches. A 5×5–8×8 block removes far more context than the task needs,
-   raising prediction uncertainty everywhere and drowning the anomaly signal. Real MVTec LOCO
-   logical anomalies involve whole components at a much larger relative scale, which is
-   exactly the regime the large blocks were designed for.
+| | synthetic spread | real spread |
+|---|---:|---:|
+| best − worst image AUROC | **0.193** | **0.013** |
 
-Until the study is re-run on the real benchmark, **the honest conclusion is that multi-scale
-masking is unsupported by the evidence collected here.** `configs/loco.yaml` keeps
-`multiscale` as the default because it is the strategy under study, and records this measured
-ordering in a comment; use `--set masking.strategy=random_patch` for the best measured
-configuration.
+So the correct statement is not "multi-scale masking failed" but **"the masking strategy has
+no measurable effect on real data, and the synthetic ordering was an artifact of one seed on
+synthetic images."** This is exactly the failure mode multi-seed reporting was added to
+catch.
+
+*What did survive:* large-block masking still localizes worse than small-block masking on
+synthetic data (pixel AUROC 0.589 vs 0.898) — an 8×8 target yields one error value for a
+128×128 region, so coarse localization was the correct prediction.
+
+### Study 1b · Logical anomalies score BELOW chance — the real finding
+
+Look again at the logical column above: **0.448–0.454 across every arm**, with seed σ of
+0.001–0.005 over 15 training runs. Below chance, reproducibly. Structural over the same runs
+is 0.837–0.860, so the model works — the *score* is inverted for one anomaly family.
+
+That logical AUROC pins to ~0.45 regardless of how the model was trained means the cause is in
+**scoring, not training**.
+
+**The mechanism.** A missing pushpin leaves an empty compartment, and an empty compartment is
+*easier* to predict than the object that belongs there. The score counts only "harder than
+normal", so a missing object registers as extra-normal and is pushed *down* the ranking. The
+synthetic data never exposed this because its logical anomalies mostly *added* structure.
+
+`anomaly.deviation: absolute` scores `|z|`, so an unexpectedly easy region counts as
+surprising too. Added as Study 7 with tests reproducing both the failure and the fix.
 
 ### Study 2 · Anomaly score function — cosine wins clearly
 
