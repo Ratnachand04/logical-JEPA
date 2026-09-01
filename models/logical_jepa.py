@@ -76,6 +76,9 @@ class LogicalJEPA(nn.Module):
         self.loss_alpha = loss_cfg.get("alpha", 0.7)
         self.loss_beta = loss_cfg.get("beta", 1.0)
         self.target_norm = loss_cfg.get("target_norm", "layernorm")
+        # per_patch (default) weights blocks by area; per_block gives every
+        # block equal say regardless of size -- see anomaly.embedding_error.
+        self.loss_reduction = loss_cfg.get("reduction", "per_patch")
 
     # ------------------------------------------------------------------ #
     # Training
@@ -118,6 +121,7 @@ class LogicalJEPA(nn.Module):
         loss, stats = jepa_loss(
             preds, targets,
             kind=self.loss_kind, alpha=self.loss_alpha, beta=self.loss_beta,
+            reduction=self.loss_reduction,
         )
         stats["masked_ratio"] = spec.num_target_patches / self.num_patches
         stats["num_blocks"] = spec.num_targets
