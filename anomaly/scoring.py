@@ -184,6 +184,7 @@ class AnomalyScorer:
         fusion: str = "mean",
         normalize: str = "global",
         normalize_localization: str | None = None,
+        deviation: str = "signed",
         sigma: float = 4.0,
         weights: dict[int, float] | None = None,
         aggregation: str = "topk",
@@ -201,6 +202,9 @@ class AnomalyScorer:
         self.normalize = normalize
         self.normalize_detection = normalize
         self.normalize_localization = normalize_localization or normalize
+        # signed = only harder-than-normal counts; absolute = |z|, so an
+        # unexpectedly *easy* region (a missing object) also counts.
+        self.deviation = deviation
         self.sigma = sigma
         self.weights = weights
         self.aggregation = aggregation
@@ -231,6 +235,7 @@ class AnomalyScorer:
                 grids, out_size=self.out_size, fusion=self.fusion,
                 weights=self.weights, normalize=normalize, sigma=self.sigma,
                 scale_stats=self.calibration.scale_stats,
+                deviation=self.deviation,
             )
 
         # Study 4 measured that no single normalisation is best at both jobs,
@@ -413,6 +418,7 @@ def build_scorer(cfg, model, mask_bank) -> AnomalyScorer:
         fusion=node.get("fusion", "mean"),
         normalize=node.get("normalize_detection", node.get("normalize", "global")),
         normalize_localization=node.get("normalize_localization", None),
+        deviation=node.get("deviation", "signed"),
         sigma=node.get("smooth_sigma", 4.0),
         weights=weights,
         aggregation=node.get("aggregation", "topk"),
