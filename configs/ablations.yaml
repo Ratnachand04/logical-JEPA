@@ -199,3 +199,39 @@ ablation:
       overrides:
         masking.strategy: random_patch
         loss.reduction: per_patch
+
+  # ---------------------------------------------------------------- #
+  # Study 6 -- VICReg collapse regulariser (trains one model per arm)
+  #
+  # These terms are a safety net, not an objective. The question is not "does
+  # VICReg raise AUROC" -- it is "can non-collapse be guaranteed without paying
+  # for it in representation quality". Read `target_std` and `dead_dim_frac`
+  # alongside the metrics: if AUROC drops while those improve, the weights are
+  # too high and the regulariser is fighting the predictive loss.
+  # ---------------------------------------------------------------- #
+  vicreg:
+    - name: vicreg_off
+      description: Baseline -- watch-and-warn only, no regularisation
+      overrides:
+        regularizer.vicreg.enabled: false
+
+    - name: vicreg_low
+      description: Low weight -- the intended safety-net setting
+      overrides:
+        regularizer.vicreg.enabled: true
+        regularizer.vicreg.var_weight: 1.0
+        regularizer.vicreg.cov_weight: 0.04
+
+    - name: vicreg_high
+      description: Deliberately over-weighted, to show the cost of over-regularising
+      overrides:
+        regularizer.vicreg.enabled: true
+        regularizer.vicreg.var_weight: 10.0
+        regularizer.vicreg.cov_weight: 1.0
+
+    - name: vicreg_var_only
+      description: Variance term alone -- isolates what the covariance term adds
+      overrides:
+        regularizer.vicreg.enabled: true
+        regularizer.vicreg.var_weight: 1.0
+        regularizer.vicreg.cov_weight: 0.0
