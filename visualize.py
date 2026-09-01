@@ -289,11 +289,89 @@ def visualize_latent(model, dataset, indices, out_path, device, window=6,
     return out_path
 
 
+
+@torch.no_grad()
+def visualize_slots(model, slot_ckpt_path, dataset, indices, out_path, device) -> str:
+    """Render each slot's attention map over real images -- the Phase 3a gate.
+
+    This is the check that decides whether the bottleneck may be wired into the
+    predictor. The numeric gate in ``train_slots.py`` can only detect total
+    collapse; only looking at the maps shows whether slots have latched onto
+    *components* (a screw, the board, the indicator strip) rather than carving
+    the image into arbitrary stripes.
+
+    Slot order is arbitrary and differs per image -- see the module docstring of
+    ``models.slot_bottleneck`` for why that is inherent, and what the project
+    does about it.
+    """
+    from models.slot_bottleneck import SlotBottleneck
+
+    payload = torch.load(slot_ckpt_path, map_location=device, weights_only=False)
+    num_slots = payload["num_slots"]
+
+    bottleneck = SlotBottleneck(
+        token_dim=payload["token_dim"], slot_dim=payload["token_dim"],
+        num_slots=num_slots,
+    ).to(device)
+    bottleneck.load_state_dict(payload["model"])
+    bottleneck.eval()
+
+    grid = model.grid_size
+    n_cols = num_slots + 2
+    fig, axes = plt.subplots(len(indices), n_cols,
+                             figsize=(1.9 * n_cols, 2.1 * len(indices)))
+    axes = np.atleast_2d(axes)
+
+    for row, idx in enumerate(indices):
+        item = dataset[idx]
+        image = item["image"].unsqueeze(0).to(device)
+        rgb = to_numpy_image(item["image"])
+
+        tokens = model.encode_targets(image)
+        _slots, attn = bottleneck.encode(tokens, return_attn=True)   # (1, S, N)
+
+        axes[row, 0].imshow(rgb)
+        axes[row, 0].set_title(item["defect_type"], fontsize=8)
+        axes[row, 0].axis("off")
+
+        # Hard assignment: which slot claims each patch.
+        assignment = attn[0].argmax(dim=0).reshape(grid, grid).cpu().numpy()
+        axes[row, 1].imshow(assignment, cmap="tab10", vmin=0, vmax=max(num_slots - 1, 1),
+                            interpolation="nearest")
+        axes[row, 1].set_title("slot assignment", fontsize=8)
+        axes[row, 1].axis("off")
+
+        for slot in range(num_slots):
+            heat = attn[0, slot].reshape(grid, grid).cpu().numpy()
+            ax = axes[row, slot + 2]
+            ax.imshow(rgb, alpha=0.35)
+            ax.imshow(
+                np.kron(heat, np.ones((rgb.shape[0] // grid, rgb.shape[1] // grid))),
+                cmap="inferno", alpha=0.65, vmin=0.0, vmax=1.0,
+            )
+            ax.set_title(f"slot {slot}  ({heat.sum() / heat.size:.2f})", fontsize=7)
+            ax.axis("off")
+
+    fig.suptitle(
+        f"Slot attention -- {num_slots} slots. Slot order is arbitrary and "
+        f"differs per image (see models/slot_bottleneck.py).",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 # --------------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualise Logical-JEPA results")
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--mode", default="grid", choices=["grid", "masks", "latent", "all"])
+    parser.add_argument("--mode", default="grid",
+                        choices=["grid", "masks", "latent", "slots", "all"])
+    parser.add_argument("--slot-checkpoint", default=None,
+                        help="slot bottleneck .pt from train_slots.py (--mode slots)")
     parser.add_argument("--defect", default=None,
                         help="restrict to good / logical_anomalies / structural_anomalies")
     parser.add_argument("--num", type=int, default=6, help="samples to draw")
@@ -323,6 +401,19 @@ def main() -> None:
     )
 
     modes = ["grid", "masks", "latent"] if args.mode == "all" else [args.mode]
+
+    if "slots" in modes:
+        if not args.slot_checkpoint:
+            raise SystemExit(
+                "--mode slots needs --slot-checkpoint (produced by train_slots.py)"
+            )
+        test_set = MVTecLOCO(root, category, "test", cfg.get_path("data.img_size", 256))
+        indices = _pick_samples(test_set, args.num, args.defect)
+        path = visualize_slots(
+            model, args.slot_checkpoint, test_set, indices,
+            os.path.join(out_dir, "slot_attention.png"), device,
+        )
+        logger.info(f"wrote {path}")
 
     if "masks" in modes:
         train_set = MVTecLOCO(root, category, "train", cfg.get_path("data.img_size", 256),
