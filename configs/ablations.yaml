@@ -235,3 +235,37 @@ ablation:
         regularizer.vicreg.enabled: true
         regularizer.vicreg.var_weight: 1.0
         regularizer.vicreg.cov_weight: 0.0
+
+  # ---------------------------------------------------------------- #
+  # Study 7 -- signed vs absolute deviation (inference only)
+  #
+  # Motivated by a measured failure, not a hunch: on real LOCO pushpins the
+  # signed score put logical anomalies BELOW chance (0.449 +/- 0.003 over 3
+  # seeds). A missing object makes its region easier to predict, so signed
+  # scoring ranks it as more normal than normal.
+  #
+  # Reading the result:
+  #   absolute lifts logical AUROC above 0.5 -> the mechanism is confirmed and
+  #                                             "anomaly == unpredictable" is
+  #                                             the wrong prior for missing
+  #                                             objects
+  #   absolute does not help                 -> the below-chance result has a
+  #                                             different cause and the next
+  #                                             step is per-defect-type analysis
+  # ---------------------------------------------------------------- #
+  deviation:
+    - name: dev_signed
+      description: Only harder-than-normal counts (current default)
+      overrides:
+        anomaly.deviation: signed
+
+    - name: dev_absolute
+      description: "|z| -- an unexpectedly easy region counts as surprise too"
+      overrides:
+        anomaly.deviation: absolute
+
+    - name: dev_absolute_max
+      description: Absolute deviation fused with max across scales
+      overrides:
+        anomaly.deviation: absolute
+        anomaly.fusion: max
