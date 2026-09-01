@@ -143,6 +143,16 @@ anomaly:
   scale_weights: null       # {2: 1.0, 4: 1.0, 6: 2.0} when fusion=weighted
   smooth_sigma: 4.0
 
+  # How a normalised grid becomes "surprise".
+  #   signed    only harder-than-normal counts (the classic assumption)
+  #   absolute  |z| -- an unexpectedly EASY region counts too
+  # MEASURED, real LOCO pushpins: signed gives logical AUROC 0.449 +/- 0.003,
+  # i.e. reliably BELOW chance, because a missing pushpin leaves an empty
+  # compartment that is *easier* to predict than the object that belongs there.
+  # Default stays `signed` because that is what every existing number was
+  # produced under; see Study 7 for the measured comparison.
+  deviation: signed         # signed | absolute
+
   aggregation: topk         # topk | max | mean
   top_k_ratio: 0.01
   distance: null            # null -> reuse loss.kind
