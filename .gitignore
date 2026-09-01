@@ -44,8 +44,12 @@ checkpoints/
 *.ckpt
 *.safetensors
 
-# Experiment outputs
-outputs/
+# Experiment outputs -- raw artefacts are regenerable and stay untracked,
+# but the per-phase written findings are deliverables and are kept.
+outputs/*
+!outputs/*/
+outputs/*/*
+!outputs/*/SUMMARY.md
 runs/
 logs/
 *.log
