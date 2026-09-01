@@ -156,3 +156,46 @@ ablation:
       description: Raw error, no normalisation at all
       overrides:
         anomaly.normalize: none
+
+  # ---------------------------------------------------------------- #
+  # Study 5 -- loss reduction (requires training one model per arm)
+  #
+  # Study 1's failure has two candidate explanations. This isolates the first:
+  # under `per_patch`, one 6x6 block (36 patches) outweighs three small blocks
+  # (~19 patches) roughly 2:1, so `multiscale` effectively trained on its
+  # large-scale objective alone. `per_block` removes exactly that asymmetry and
+  # changes nothing else.
+  #
+  # Reading the result:
+  #   multiscale improves and closes the gap -> loss weighting was the cause
+  #   multiscale still loses                 -> the second explanation (anomaly
+  #                                             scale vs block size) leads, and
+  #                                             the next experiment is block-size
+  #                                             ranges, not loss weighting
+  # ---------------------------------------------------------------- #
+  loss_reduction:
+    - name: red_multiscale_per_patch
+      description: Multi-scale masking, per-patch weighting (Study 1 baseline)
+      overrides:
+        masking.strategy: multiscale
+        masking.mode: mixed
+        loss.reduction: per_patch
+
+    - name: red_multiscale_per_block
+      description: Multi-scale masking, per-block weighting (the fix under test)
+      overrides:
+        masking.strategy: multiscale
+        masking.mode: mixed
+        loss.reduction: per_block
+
+    - name: red_random_patch_per_block
+      description: Control -- the winning arm is single-scale, so per_block must not move it
+      overrides:
+        masking.strategy: random_patch
+        loss.reduction: per_block
+
+    - name: red_random_patch_per_patch
+      description: Control -- the Study 1 winner, unchanged
+      overrides:
+        masking.strategy: random_patch
+        loss.reduction: per_patch
