@@ -29,6 +29,7 @@ LOCO AD; the README says so explicitly.
 
 from __future__ import annotations
 
+import json
 import os
 import random
 
@@ -49,6 +50,23 @@ MOUNTS = [(0.20, 0.20), (0.80, 0.20), (0.20, 0.80), (0.80, 0.80)]
 LOGICAL_TYPES = ("missing_screw", "extra_screw", "misplaced_screw",
                  "wrong_count", "swapped_indicator")
 STRUCTURAL_TYPES = ("scratch", "contamination", "chip")
+
+# Which way each defect moves the amount of content in its region. Phase 1's
+# below-chance logical result was attributed to *removal* (an emptied region is
+# easier to predict), so the two directions are reported separately.
+DEFECT_DIRECTION = {
+    "missing_screw": "removal",
+    "wrong_count": "removal",
+    "extra_screw": "addition",
+    "misplaced_screw": "rearrangement",
+    "swapped_indicator": "rearrangement",
+    "scratch": "structural",
+    "contamination": "structural",
+    "chip": "structural",
+}
+
+# Written beside the category so evaluation can break results down by subtype.
+SUBTYPE_MANIFEST = "defect_subtypes.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -260,6 +278,7 @@ def generate_dataset(
     for i in range(n_test_good):
         _save(os.path.join(base, "test", "good", f"{i:03d}.png"), generate_normal(rng))
 
+    manifest: dict[str, dict[str, str]] = {}
     for family, types, count in (
         ("logical_anomalies", LOGICAL_TYPES, n_test_logical),
         ("structural_anomalies", STRUCTURAL_TYPES, n_test_structural),
@@ -272,6 +291,12 @@ def generate_dataset(
             # Ground truth is a directory of region masks, matching the real
             # benchmark's format even though we only emit one region here.
             _save(os.path.join(base, "ground_truth", family, f"{i:03d}", "000.png"), mask)
+            manifest[f"{family}/{i:03d}.png"] = {
+                "subtype": defect, "direction": DEFECT_DIRECTION[defect],
+            }
+
+    with open(os.path.join(base, SUBTYPE_MANIFEST), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=1, sort_keys=True)
 
     if verbose:
         print(f"Synthetic dataset written to {base}")

@@ -27,6 +27,11 @@ from utils.config import load_config, save_config
 from utils.logging_utils import MetricTracker, get_logger, save_json
 from utils.seed import seed_everything
 
+# Logged when the slot stage is enabled. `slot_entropy_ratio` is the Phase 3a
+# gate metric, tracked live: near 1.0 means the grouping has collapsed.
+SLOT_STATS = ("loss_slot_recon", "loss_hier", "hier_lambda", "loss_card",
+              "slot_entropy_ratio")
+
 
 # --------------------------------------------------------------------------- #
 # Optimisation schedules
@@ -85,6 +90,9 @@ def apply_schedules(optimizer, lr: float, wd: float) -> None:
 # --------------------------------------------------------------------------- #
 def save_checkpoint(path: str, model, optimizer, cfg, epoch: int, step: int, stats: dict) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    # Write-then-rename: an interrupted save must never leave a truncated
+    # final.pt that a later --no-retrain run would silently reuse.
+    tmp_path = path + ".tmp"
     torch.save(
         {
             "model": model.state_dict(),
@@ -94,8 +102,9 @@ def save_checkpoint(path: str, model, optimizer, cfg, epoch: int, step: int, sta
             "step": step,
             "stats": stats,
         },
-        path,
+        tmp_path,
     )
+    os.replace(tmp_path, path)
 
 
 def load_checkpoint(path: str, model, optimizer=None, device="cpu") -> dict:
@@ -142,7 +151,14 @@ def train(cfg, logger) -> str:
 
     # Only the student and predictor are optimised; the teacher is EMA-driven.
     trainable = torch.nn.ModuleList([model.context_encoder, model.predictor])
-    optimizer = torch.optim.AdamW(build_param_groups(trainable, base_wd), lr=base_lr)
+    param_groups = build_param_groups(trainable, base_wd)
+    aux_params = model.aux_parameters()
+    if aux_params:
+        # Slot module + cardinality head train on their own objectives. The
+        # I-JEPA weight-decay ramp (to 0.4) is tuned for the encoder, not for a
+        # grouping module, so they keep a small fixed decay instead.
+        param_groups.append({"params": aux_params, "weight_decay": 1e-4, "wd_scale": 0.0})
+    optimizer = torch.optim.AdamW(param_groups, lr=base_lr)
 
     steps_per_epoch = max(len(train_loader), 1)
     total_steps = steps_per_epoch * epochs
@@ -184,6 +200,7 @@ def train(cfg, logger) -> str:
             # Curriculum masking needs to know how far along training is.
             if hasattr(mask_gen, "set_progress"):
                 mask_gen.set_progress(global_step / max(total_steps, 1))
+            model.set_progress(global_step / max(total_steps, 1))
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -204,7 +221,11 @@ def train(cfg, logger) -> str:
             if grad_clip and grad_clip > 0:
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
+                # Clipped separately: one joint norm would let a large slot
+                # reconstruction gradient shrink the JEPA's update.
                 torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), grad_clip)
+                if aux_params:
+                    torch.nn.utils.clip_grad_norm_(aux_params, 1.0)
 
             if scaler.is_enabled():
                 scaler.step(optimizer)
@@ -220,6 +241,7 @@ def train(cfg, logger) -> str:
                 cos_sim=step_stats["cos_sim"],
                 target_std=step_stats["target_std"],
                 masked=step_stats["masked_ratio"],
+                **{k: step_stats[k] for k in SLOT_STATS if k in step_stats},
             )
             progress.set_postfix(
                 loss=f"{tracker['loss'].smooth:.4f}",
@@ -239,6 +261,7 @@ def train(cfg, logger) -> str:
                 f"cos_sim={epoch_stats['cos_sim']:.4f}  "
                 f"target_std={epoch_stats['target_std']:.4f}  "
                 f"lr={lr:.2e}  m={momentum:.5f}"
+                + "".join(f"  {k}={epoch_stats[k]:.4f}" for k in SLOT_STATS if k in epoch_stats)
             )
 
         # target_std collapsing to ~0 means the encoder found the constant

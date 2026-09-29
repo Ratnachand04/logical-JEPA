@@ -269,3 +269,85 @@ ablation:
       overrides:
         anomaly.deviation: absolute
         anomaly.fusion: max
+
+  # ---------------------------------------------------------------- #
+  # Study 8 -- hierarchical slot loss (Phase 3b; trains one model per arm)
+  #
+  # Every arm trains the slot module and the cardinality head, so they differ
+  # ONLY in lambda. `hier_lambda_0` is the control: slot stage present, slot
+  # term logged but not trained on -- its JEPA is the plain JEPA, since the
+  # slot module and head receive only detached inputs.
+  #
+  # Reading the result:
+  #   logical AUROC rises with lambda   -> set-level consistency helps the
+  #                                        predictor reason about composition
+  #   flat within seed noise            -> the patch term already carries it
+  #   falls with lambda                 -> the slot term fights the patch term
+  # Read `loss_hier` in the training log alongside: if it does not fall as
+  # lambda rises, the term is not being optimised at all.
+  # ---------------------------------------------------------------- #
+  hierarchical:
+    - name: hier_lambda_0
+      description: Control -- slot stage trained, slot term weight 0
+      overrides:
+        slots.enabled: true
+        slots.hierarchical_weight: 0.0
+
+    - name: hier_lambda_0.1
+      description: Slot term at lambda 0.1
+      overrides:
+        slots.enabled: true
+        slots.hierarchical_weight: 0.1
+
+    - name: hier_lambda_0.5
+      description: Slot term at lambda 0.5
+      overrides:
+        slots.enabled: true
+        slots.hierarchical_weight: 0.5
+
+    - name: hier_lambda_2
+      description: Deliberately over-weighted slot term
+      overrides:
+        slots.enabled: true
+        slots.hierarchical_weight: 2.0
+
+  # ---------------------------------------------------------------- #
+  # Study 9 -- cardinality channel (Phase 3c; inference only)
+  #
+  # Re-scores the Study 8 control checkpoint. The question is Phase 1's:
+  # does a direction-free, count-like score recover the REMOVAL anomalies that
+  # signed latent error under-ranks? Read `removal_auroc` first; the synthetic
+  # set labels every logical defect by direction.
+  #
+  # `dev_absolute` is included because it is the other fix for the same
+  # failure (Study 7) -- the two should be compared, not assumed to stack.
+  # ---------------------------------------------------------------- #
+  cardinality:
+    - name: card_off
+      description: JEPA latent error only (signed)
+      overrides:
+        anomaly.cardinality: "off"
+        anomaly.deviation: signed
+
+    - name: card_dev_absolute
+      description: JEPA with absolute deviation (Study 7 fix), no cardinality
+      overrides:
+        anomaly.cardinality: "off"
+        anomaly.deviation: absolute
+
+    - name: card_only
+      description: Cardinality channel alone
+      overrides:
+        anomaly.cardinality: only
+
+    - name: card_add
+      description: JEPA (signed) + cardinality
+      overrides:
+        anomaly.cardinality: add
+        anomaly.deviation: signed
+
+    - name: card_add_absolute
+      description: JEPA (absolute) + cardinality
+      overrides:
+        anomaly.cardinality: add
+        anomaly.deviation: absolute

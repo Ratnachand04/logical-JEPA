@@ -21,7 +21,12 @@ import os
 import numpy as np
 import torch
 
-from anomaly.metrics import evaluate_split, summarize
+from anomaly.metrics import (
+    evaluate_split,
+    load_subtype_manifest,
+    subtype_breakdown,
+    summarize,
+)
 from anomaly.scoring import build_scorer
 from datasets.mvtec_loco import build_dataloaders, build_normal_loader
 from masking import SweepMaskBank
@@ -79,7 +84,9 @@ def evaluate(cfg, checkpoint: str, logger, save_arrays: bool = False) -> dict:
     logger.info(f"Sweep: {bank.describe()}")
     logger.info(
         f"Scoring: distance={scorer.distance or model.loss_kind} fusion={scorer.fusion} "
-        f"aggregation={scorer.aggregation}"
+        f"aggregation={scorer.aggregation} deviation={scorer.deviation} "
+        f"cardinality={scorer.cardinality}"
+        + (f" (weight {scorer.cardinality_weight})" if scorer.uses_cardinality else "")
     )
 
     # ---- calibration on NORMAL images only --------------------------- #
@@ -117,6 +124,13 @@ def evaluate(cfg, checkpoint: str, logger, save_arrays: bool = False) -> dict:
     )
     results["normalize_detection"] = scorer.normalize_detection
     results["normalize_localization"] = scorer.normalize_localization
+    results["cardinality"] = scorer.cardinality
+    results["deviation"] = scorer.deviation
+
+    manifest = load_subtype_manifest(
+        os.path.join(cfg.get_path("data.root"), category))
+    if manifest and out.get("paths"):
+        results.update(subtype_breakdown(out["scores"], out["labels"], out["paths"], manifest))
 
     # When the two differ, also report what localisation *would* have been under
     # the detection normalisation, so the trade-off is visible in one place

@@ -21,16 +21,33 @@ Inference (anomaly detection)::
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.func import functional_call
 
 from anomaly.embedding_error import jepa_loss, patch_distance
 
+from .cardinality import CardinalityHead
 from .context_encoder import ContextEncoder, build_context_encoder
 from .patch_embed import gather_tokens
 from .predictor import JEPAPredictor, build_predictor
+from .slot_bottleneck import (
+    background_slot,
+    build_slot_bottleneck,
+    chamfer_slot_distance,
+    region_foreground_mass,
+    slot_attention_entropy,
+    sorted_usage,
+)
 from .target_encoder import TargetEncoder, normalize_targets
 from .vicreg import build_vicreg, collapse_report, vicreg_loss
+
+# Fixed seed for the slot initialisation at inference, so an image's slot
+# grouping -- and therefore its cardinality score -- does not depend on the run.
+_INFERENCE_SLOT_SEED = 0
 
 
 class LogicalJEPA(nn.Module):
@@ -51,6 +68,7 @@ class LogicalJEPA(nn.Module):
         loss_cfg: dict | None = None,
         ema_cfg: dict | None = None,
         regularizer_cfg: dict | None = None,
+        slots_cfg: dict | None = None,
     ):
         super().__init__()
         encoder_cfg = dict(encoder_cfg or {})
@@ -85,6 +103,45 @@ class LogicalJEPA(nn.Module):
         # Optional collapse regulariser. None when disabled, so the term costs
         # nothing rather than being multiplied by a zero weight.
         self.vicreg = build_vicreg(regularizer_cfg)
+
+        # Optional slot stage (Phases 3b/3c). The slot module learns its grouping
+        # from detached teacher tokens by reconstruction alone; the JEPA only
+        # sees it through the hierarchical term, with its parameters frozen.
+        slots_cfg = dict(slots_cfg or {})
+        self.slots = build_slot_bottleneck(slots_cfg, token_dim=self.embed_dim)
+        self.card_head: CardinalityHead | None = None
+        self.slot_recon_weight = float(slots_cfg.get("recon_weight", 1.0))
+        self.hier_weight = float(slots_cfg.get("hierarchical_weight", 0.0))
+        self.hier_start = float(slots_cfg.get("hierarchical_start", 0.3))
+        self.hier_ramp = float(slots_cfg.get("hierarchical_ramp", 0.1))
+        self.card_weight = 0.0
+        if self.slots is not None:
+            card_cfg = dict(slots_cfg.get("cardinality", {}) or {})
+            if card_cfg.get("enabled", True):
+                self.card_head = CardinalityHead(
+                    num_slots=self.slots.num_slots, grid_size=self.grid_size,
+                    pos_dim=card_cfg.get("pos_dim", 64),
+                    hidden_dim=card_cfg.get("hidden_dim", 128),
+                )
+                self.card_weight = float(card_cfg.get("weight", 1.0))
+        self.progress = 0.0
+
+    def set_progress(self, progress: float) -> None:
+        """Training progress in [0, 1]; drives the hierarchical-term ramp."""
+        self.progress = float(progress)
+
+    def hierarchical_lambda(self) -> float:
+        """Current slot-term weight: 0 until ``hierarchical_start``, then a linear ramp.
+
+        The delay is not optional. Early in training the teacher is near-random
+        and the slot module has not yet grouped anything (Phase 3a: an
+        unconverged bottleneck is indistinguishable from a collapsed one), so a
+        slot term applied from step 0 would pull the predictor towards noise.
+        """
+        if self.hier_weight <= 0:
+            return 0.0
+        ramp = (self.progress - self.hier_start) / max(self.hier_ramp, 1e-6)
+        return self.hier_weight * min(max(ramp, 0.0), 1.0)
 
     # ------------------------------------------------------------------ #
     # Training
@@ -139,9 +196,87 @@ class LogicalJEPA(nn.Module):
             stats.update(reg_stats)
             stats.update(collapse_report(flat, gamma=self.vicreg["gamma"]))
 
+        if self.slots is not None:
+            aux_loss, aux_stats = self._slot_losses(full_target, ctx_idx, blocks, preds)
+            loss = loss + aux_loss
+            stats.update(aux_stats)
+
         stats["masked_ratio"] = spec.num_target_patches / self.num_patches
         stats["num_blocks"] = spec.num_targets
         return loss, stats
+
+    def _slot_losses(self, full_target, ctx_idx, blocks, preds):
+        """Slot reconstruction (3a), hierarchical slot term (3b), cardinality (3c).
+
+        Gradient routing is the whole design, so it is spelled out:
+
+        * reconstruction   -> slot module only (teacher tokens are detached);
+        * hierarchical     -> predictor + context encoder only (slot parameters
+                              are passed in detached, so the slot module cannot
+                              flatten its grouping to make the term trivially 0);
+        * cardinality      -> head only (its inputs are detached slot attention).
+        """
+        B, N, D = full_target.shape
+        stats: dict = {}
+        sa = self.slots.slot_attention
+        init = sa.init_slots(B, full_target.device)
+
+        recon, slots_true, attn_true = self.slots(
+            full_target, self.context_encoder.pos_embed, return_attn=True, slots_init=init
+        )
+        recon_loss = F.mse_loss(recon.float(), full_target.float())
+        total = self.slot_recon_weight * recon_loss
+        stats["loss_slot_recon"] = float(recon_loss.detach())
+        with torch.no_grad():
+            stats["slot_entropy_ratio"] = float(
+                slot_attention_entropy(attn_true.float()) / math.log(self.slots.num_slots)
+            )
+
+        # ---- 3b: hierarchical slot term ------------------------------------
+        lam = self.hierarchical_lambda()
+        composite = full_target
+        for blk, pred in zip(blocks, preds):
+            composite = composite.scatter(
+                1, blk.unsqueeze(-1).expand(-1, -1, D), pred.to(composite.dtype)
+            )
+        frozen = {k: v.detach() for k, v in sa.named_parameters()}
+        with torch.set_grad_enabled(lam > 0 and torch.is_grad_enabled()):
+            slots_pred = functional_call(sa, frozen, (composite,),
+                                         {"slots_init": init.detach()})
+            hier = chamfer_slot_distance(slots_pred.float(), slots_true.detach().float()).mean()
+        if lam > 0:
+            total = total + lam * hier
+        stats["loss_hier"] = float(hier.detach())
+        stats["hier_lambda"] = lam
+
+        # ---- 3c: cardinality head ------------------------------------------
+        if self.card_head is not None:
+            with torch.no_grad():
+                attn_full = attn_true.detach().float()
+                bg = background_slot(attn_full)
+                ctx_tokens = gather_tokens(full_target, ctx_idx)
+                _, attn_ctx = sa(ctx_tokens, return_attn=True, slots_init=init.detach())
+                usage = sorted_usage(attn_ctx.float())
+            card_losses = []
+            for blk in blocks:
+                with torch.no_grad():
+                    actual = region_foreground_mass(attn_full, blk, bg)
+                predicted = self.card_head(usage, blk)
+                card_losses.append(F.mse_loss(predicted.float(), actual))
+            card_loss = torch.stack(card_losses).mean()
+            total = total + self.card_weight * card_loss
+            stats["loss_card"] = float(card_loss.detach())
+
+        return total, stats
+
+    def aux_parameters(self) -> list:
+        """Slot module + cardinality head: optimised, but on their own objectives."""
+        params = []
+        if self.slots is not None:
+            params += list(self.slots.parameters())
+        if self.card_head is not None:
+            params += list(self.card_head.parameters())
+        return params
 
     @torch.no_grad()
     def update_target_encoder(self, step: int, total_steps: int) -> float:
@@ -229,6 +364,51 @@ class LogicalJEPA(nn.Module):
 
         return err.reshape(B, M, Kt), tgt_idx
 
+    @property
+    def has_cardinality(self) -> bool:
+        return self.slots is not None and self.card_head is not None
+
+    @torch.no_grad()
+    def _inference_slot_init(self, batch: int, device) -> torch.Tensor:
+        """One fixed slot draw shared by every image, so scores are reproducible
+        and independent of an image's position in its batch."""
+        sa = self.slots.slot_attention
+        gen = torch.Generator(device=device).manual_seed(_INFERENCE_SLOT_SEED)
+        return sa.init_slots(1, device, generator=gen).expand(batch, -1, -1)
+
+    @torch.no_grad()
+    def cardinality_scale(self, full_target, context_idx, target_idx,
+                          attn_full, bg) -> torch.Tensor:
+        """|predicted - actual| foreground mass for a chunk of sweep positions.
+
+        Args:
+            full_target: (B, N, D) normalised teacher tokens.
+            context_idx / target_idx: (M, Kc) / (M, Kt) sweep indices.
+            attn_full: (B, S, N) slot attention over the full image.
+            bg: (B,) background slot per image.
+
+        Returns:
+            (B, M) cardinality error per image and window position.
+        """
+        B, N, D = full_target.shape
+        M = target_idx.size(0)
+        device = full_target.device
+
+        ctx_b = context_idx.to(device).unsqueeze(0).expand(B, -1, -1).reshape(B * M, -1)
+        tgt_b = target_idx.to(device).unsqueeze(0).expand(B, -1, -1).reshape(B * M, -1)
+        tokens_b = full_target.unsqueeze(1).expand(B, M, -1, -1).reshape(B * M, N, D)
+
+        ctx_tokens = gather_tokens(tokens_b, ctx_b)
+        init = self._inference_slot_init(B * M, device)
+        _, attn_ctx = self.slots.slot_attention(ctx_tokens, return_attn=True, slots_init=init)
+        predicted = self.card_head(sorted_usage(attn_ctx.float()), tgt_b)
+
+        attn_b = attn_full.unsqueeze(1).expand(B, M, -1, -1).reshape(B * M, *attn_full.shape[1:])
+        bg_b = bg.unsqueeze(1).expand(B, M).reshape(-1)
+        actual = region_foreground_mass(attn_b, tgt_b, bg_b)
+
+        return (predicted.float() - actual).abs().view(B, M)
+
     @torch.no_grad()
     def anomaly_grids(
         self,
@@ -237,7 +417,8 @@ class LogicalJEPA(nn.Module):
         chunk: int = 16,
         distance: str | None = None,
         alpha: float | None = None,
-    ) -> dict[int, torch.Tensor]:
+        with_cardinality: bool = False,
+    ):
         """Per-scale anomaly grids for a batch of images.
 
         For each window size in ``mask_bank`` the sweep errors are scattered
@@ -245,18 +426,36 @@ class LogicalJEPA(nn.Module):
         patch.
 
         Returns:
-            ``{window_size: (B, grid, grid) tensor}``.
+            ``{window_size: (B, grid, grid) tensor}``; with ``with_cardinality``
+            a pair ``(grids, cardinality_grids)`` in the same format, where each
+            window's cardinality error is spread over every patch it covers.
         """
+        if with_cardinality and not self.has_cardinality:
+            raise ValueError(
+                "Cardinality scoring requested, but this model was trained without "
+                "a cardinality head (slots.enabled / slots.cardinality.enabled)."
+            )
+
         self.eval()
         B = images.size(0)
         device = images.device
         full_target = self.encode_targets(images)
 
+        attn_full = bg = None
+        if with_cardinality:
+            init = self._inference_slot_init(B, device)
+            _, attn_full = self.slots.slot_attention(full_target, return_attn=True,
+                                                     slots_init=init)
+            attn_full = attn_full.float()
+            bg = background_slot(attn_full)
+
         grids: dict[int, torch.Tensor] = {}
+        card_grids: dict[int, torch.Tensor] = {}
 
         for window in mask_bank.scales():
             accum = torch.zeros(B, self.num_patches, device=device)
             count = torch.zeros(B, self.num_patches, device=device)
+            card_accum = torch.zeros(B, self.num_patches, device=device)
 
             for ctx_idx, tgt_idx, _boxes in mask_bank.batched(window, chunk=chunk):
                 err, tgt = self.sweep_scale(
@@ -265,13 +464,22 @@ class LogicalJEPA(nn.Module):
                 )                                                        # (B, M, Kt)
 
                 flat_idx = tgt.reshape(1, -1).expand(B, -1)              # (B, M*Kt)
-                accum.scatter_add_(1, flat_idx, err.reshape(B, -1))
-                count.scatter_add_(1, flat_idx, torch.ones_like(err.reshape(B, -1)))
+                accum.scatter_add_(1, flat_idx, err.reshape(B, -1).float())
+                count.scatter_add_(1, flat_idx, torch.ones_like(err.reshape(B, -1)).float())
+
+                if with_cardinality:
+                    card = self.cardinality_scale(full_target, ctx_idx, tgt_idx,
+                                                  attn_full, bg)          # (B, M)
+                    card = card.unsqueeze(-1).expand(-1, -1, tgt.size(-1))
+                    card_accum.scatter_add_(1, flat_idx, card.reshape(B, -1))
 
             grid = accum / count.clamp_min(1.0)
             grids[window] = grid.view(B, self.grid_size, self.grid_size)
+            if with_cardinality:
+                card_grids[window] = (card_accum / count.clamp_min(1.0)).view(
+                    B, self.grid_size, self.grid_size)
 
-        return grids
+        return (grids, card_grids) if with_cardinality else grids
 
     # ------------------------------------------------------------------ #
     # Checkpointing
@@ -279,11 +487,19 @@ class LogicalJEPA(nn.Module):
     def describe(self) -> str:
         ctx = self.context_encoder.num_parameters()
         pred = self.predictor.num_parameters()
-        return (
+        text = (
             f"LogicalJEPA(grid={self.grid_size}x{self.grid_size}, dim={self.embed_dim}, "
             f"encoder={ctx/1e6:.2f}M, predictor={pred/1e6:.2f}M, "
             f"trainable={(ctx+pred)/1e6:.2f}M, teacher={self.target_encoder.num_parameters()/1e6:.2f}M frozen)"
         )
+        if self.slots is not None:
+            text += (
+                f"\n  + {self.slots.describe()}, hierarchical lambda={self.hier_weight} "
+                f"(from {self.hier_start:.0%} of training)"
+            )
+        if self.card_head is not None:
+            text += f"\n  + CardinalityHead({self.card_head.num_parameters()/1e3:.1f}K params)"
+        return text
 
 
 def build_model(cfg) -> LogicalJEPA:
@@ -299,4 +515,5 @@ def build_model(cfg) -> LogicalJEPA:
         loss_cfg=cfg.get("loss", {}),
         ema_cfg=cfg.get("ema", {}),
         regularizer_cfg=cfg.get("regularizer", {}),
+        slots_cfg=cfg.get("slots", {}),
     )

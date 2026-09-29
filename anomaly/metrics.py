@@ -213,6 +213,60 @@ def evaluate_split(
     return results
 
 
+def load_subtype_manifest(category_dir: str) -> dict | None:
+    """``{"<family>/<file>": {"subtype", "direction"}}`` if the dataset ships one.
+
+    The synthetic generator writes it; real MVTec LOCO does not, in which case
+    the breakdown is simply skipped.
+    """
+    import json
+    import os
+
+    path = os.path.join(category_dir, "defect_subtypes.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def subtype_breakdown(scores: np.ndarray, labels: np.ndarray, paths: list[str],
+                      manifest: dict) -> dict:
+    """Image AUROC per defect subtype and per direction, each against all normals.
+
+    Direction (``removal`` / ``addition`` / ``rearrangement``) is the grouping
+    that tests the Phase 1 mechanism: if missing content is what signed scoring
+    under-ranks, ``removal_auroc`` is where it shows.
+
+    Returns flat keys (``subtype_<name>_auroc``, ``<direction>_auroc``) so they
+    flow through the multi-seed aggregation like any other metric.
+    """
+    import os
+
+    scores = np.asarray(scores).reshape(-1)
+    labels = np.asarray(labels).reshape(-1)
+    normal = labels == 0
+
+    subtypes, directions = [], []
+    for path in paths:
+        parts = os.path.normpath(path).replace("\\", "/").split("/")
+        entry = manifest.get("/".join(parts[-2:]), {})
+        subtypes.append(entry.get("subtype", ""))
+        directions.append(entry.get("direction", ""))
+    subtypes, directions = np.array(subtypes), np.array(directions)
+
+    out: dict[str, float] = {}
+    # "structural" as a direction is exactly the structural family, which
+    # `structural_auroc` already reports.
+    for prefix, groups, skip in (("subtype_", subtypes, {""}),
+                                 ("", directions, {"", "structural"})):
+        for name in sorted(set(groups[~normal]) - skip):
+            member = groups == name
+            if normal.any() and member.any():
+                subset = normal | member
+                out[f"{prefix}{name}_auroc"] = image_auroc(scores[subset], labels[subset])
+    return out
+
+
 def summarize(results: dict, title: str = "Results") -> str:
     """Human-readable metric block for the console and the log file."""
     lines = [f"=== {title} ===",
@@ -234,5 +288,13 @@ def summarize(results: dict, title: str = "Results") -> str:
     row("Pixel AUROC - STRUCTURAL", "structural_pixel_auroc")
     row("AU-PRO      - LOGICAL", "logical_au_pro")
     row("AU-PRO      - STRUCTURAL", "structural_au_pro")
+
+    breakdown = sorted(k for k in results
+                       if k.endswith("_auroc") and (k.startswith("subtype_") or k in (
+                           "removal_auroc", "addition_auroc", "rearrangement_auroc")))
+    if breakdown:
+        lines.append("  -- by defect subtype / direction --")
+        for key in breakdown:
+            row(key.replace("subtype_", "  ").replace("_auroc", ""), key)
 
     return "\n".join(lines)
