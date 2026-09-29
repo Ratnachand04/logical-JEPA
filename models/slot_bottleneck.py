@@ -130,6 +130,7 @@ class SlotAttention(nn.Module):
         tokens: torch.Tensor,
         num_iters: int | None = None,
         return_attn: bool = False,
+        slots_init: torch.Tensor | None = None,
     ):
         """(B, N, input_dim) -> (B, num_slots, dim).
 
@@ -138,6 +139,10 @@ class SlotAttention(nn.Module):
             num_iters: override the configured iteration count.
             return_attn: also return the (B, num_slots, N) attention map, which
                 is what ``visualize.py --mode slots`` renders.
+            slots_init: (B, num_slots, dim) starting slots. Two token sets that
+                must be compared (a composite and its reference, or a context
+                and its full image) need the *same* starting noise, otherwise
+                part of the difference between their slot sets is just the draw.
         """
         B, N, _ = tokens.shape
         iters = num_iters or self.iters
@@ -146,7 +151,7 @@ class SlotAttention(nn.Module):
         k = self.to_k(tokens)
         v = self.to_v(tokens)
 
-        slots = self.init_slots(B, tokens.device)
+        slots = self.init_slots(B, tokens.device) if slots_init is None else slots_init
         attn = None
 
         for i in range(iters):
@@ -223,9 +228,10 @@ class SlotBottleneck(nn.Module):
         self.apply(init_vit_weights)
 
     # ------------------------------------------------------------------ #
-    def encode(self, tokens: torch.Tensor, return_attn: bool = False):
+    def encode(self, tokens: torch.Tensor, return_attn: bool = False,
+               slots_init: torch.Tensor | None = None):
         """Patch tokens -> slots."""
-        return self.slot_attention(tokens, return_attn=return_attn)
+        return self.slot_attention(tokens, return_attn=return_attn, slots_init=slots_init)
 
     def broadcast(self, slots: torch.Tensor, pos_embed: torch.Tensor) -> torch.Tensor:
         """Slots -> per-patch features, addressed by position.
@@ -253,9 +259,9 @@ class SlotBottleneck(nn.Module):
         return self.decoder_out(mixed + pos_embed)
 
     def forward(self, tokens: torch.Tensor, pos_embed: torch.Tensor,
-                return_attn: bool = False):
+                return_attn: bool = False, slots_init: torch.Tensor | None = None):
         """Full round trip, used by the isolation gate."""
-        slots, attn = self.encode(tokens, return_attn=True)
+        slots, attn = self.encode(tokens, return_attn=True, slots_init=slots_init)
         recon = self.broadcast(slots, pos_embed)
         return (recon, slots, attn) if return_attn else (recon, slots)
 
@@ -310,6 +316,64 @@ def slot_usage(attn: torch.Tensor) -> torch.Tensor:
     """
     mass = attn.sum(dim=-1)                                # (B, S)
     return mass / mass.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
+
+def chamfer_slot_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Permutation-invariant distance between two slot sets. (B, S, D) x2 -> (B,).
+
+    Each slot is matched to its nearest (cosine) slot in the other set, in both
+    directions, and the matched distances are averaged over slots. Slot *i* is
+    never compared with slot *i*: slot order is arbitrary (see module doc).
+    Symmetric, so a slot that appears in one set but has no counterpart in the
+    other is penalised from both sides.
+    """
+    a_n = F.normalize(a, dim=-1)
+    b_n = F.normalize(b, dim=-1)
+    dist = 1.0 - torch.einsum("bsd,btd->bst", a_n, b_n)          # (B, S, T)
+    a_to_b = dist.min(dim=2).values.mean(dim=1)
+    b_to_a = dist.min(dim=1).values.mean(dim=1)
+    return 0.5 * (a_to_b + b_to_a)
+
+
+def sorted_usage(attn: torch.Tensor) -> torch.Tensor:
+    """Slot usage sorted in descending order. (B, S, N) -> (B, S).
+
+    Sorting is what makes the vector usable as a feature despite unstable slot
+    identity: "the largest group takes 60%" means the same thing in every image,
+    "slot 3 takes 60%" does not.
+    """
+    mass = attn.sum(dim=-1)
+    usage = mass / mass.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    return usage.sort(dim=-1, descending=True).values
+
+
+def background_slot(attn: torch.Tensor) -> torch.Tensor:
+    """Index of the slot holding the most attention mass per image. (B, S, N) -> (B,)."""
+    return attn.sum(dim=-1).argmax(dim=-1)
+
+
+def region_foreground_mass(attn: torch.Tensor, region_idx: torch.Tensor,
+                           bg: torch.Tensor) -> torch.Tensor:
+    """Share of a region's attention that is *not* on the background slot.
+
+    The scalar the cardinality head predicts. Phase 3a found slots group by
+    component *type* (all screws in one slot), so instances cannot be counted
+    directly; but the non-background mass inside a region grows with how many
+    components it holds and drops to ~0 when a component is missing.
+
+    Args:
+        attn: (B, S, N) slot attention over the full image.
+        region_idx: (B, K) patch indices of the region.
+        bg: (B,) background slot per image, from :func:`background_slot`.
+
+    Returns:
+        (B,) values in [0, 1].
+    """
+    S = attn.size(1)
+    cols = torch.gather(attn, 2, region_idx.unsqueeze(1).expand(-1, S, -1))  # (B, S, K)
+    region = cols.sum(dim=-1)                                                # (B, S)
+    region = region / region.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    return 1.0 - region.gather(1, bg.view(-1, 1)).squeeze(1)
 
 
 def build_slot_bottleneck(cfg, token_dim: int):

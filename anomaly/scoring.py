@@ -21,9 +21,10 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from .anomaly_map import build_anomaly_map
+from .anomaly_map import fuse_scales, upsample_map
 
 AGGREGATIONS = ("topk", "max", "mean", "topk_grid")
+CARDINALITY_MODES = ("off", "add", "only")
 
 
 def aggregate_score(
@@ -78,6 +79,8 @@ class Calibration:
     map_hi: float = 1.0
     n_samples: int = 0
     scale_stats: dict = field(default_factory=dict)
+    # Same format as scale_stats, for the cardinality grids (Phase 3c).
+    card_stats: dict = field(default_factory=dict)
 
     def normalize(self, scores: np.ndarray) -> np.ndarray:
         """Express scores as standard deviations above the normal mean."""
@@ -106,22 +109,27 @@ class Calibration:
             "n_samples": self.n_samples,
             # JSON keys must be strings and numpy grids must become nested
             # lists; from_dict reverses both.
-            "scale_stats": {
-                str(k): [np.asarray(v[0]).tolist(), np.asarray(v[1]).tolist()]
-                for k, v in self.scale_stats.items()
-            },
+            "scale_stats": _stats_to_json(self.scale_stats),
+            "card_stats": _stats_to_json(self.card_stats),
         }
 
     @classmethod
     def from_dict(cls, payload: dict) -> "Calibration":
         fields = {k: payload[k] for k in payload if k in cls.__annotations__}
-        if "scale_stats" in fields:
-            fields["scale_stats"] = {
-                int(k): (np.asarray(v[0], dtype=np.float32),
-                         np.asarray(v[1], dtype=np.float32))
-                for k, v in (fields["scale_stats"] or {}).items()
-            }
+        for key in ("scale_stats", "card_stats"):
+            if key in fields:
+                fields[key] = _stats_from_json(fields[key])
         return cls(**fields)
+
+
+def _stats_to_json(stats: dict) -> dict:
+    return {str(k): [np.asarray(v[0]).tolist(), np.asarray(v[1]).tolist()]
+            for k, v in (stats or {}).items()}
+
+
+def _stats_from_json(payload: dict | None) -> dict:
+    return {int(k): (np.asarray(v[0], dtype=np.float32), np.asarray(v[1], dtype=np.float32))
+            for k, v in (payload or {}).items()}
 
 
 def fit_calibration(
@@ -160,6 +168,39 @@ def fit_calibration(
     return calib
 
 
+class _MomentAccumulator:
+    """Running per-position mean / std of ``{window: (B, H, W)}`` grids."""
+
+    def __init__(self):
+        self.sums: dict[int, torch.Tensor] = {}
+        self.sq_sums: dict[int, torch.Tensor] = {}
+        self.counts: dict[int, int] = {}
+
+    def add(self, grids: dict[int, torch.Tensor]) -> None:
+        for window, grid in grids.items():
+            g = grid.double()
+            self.sums[window] = self.sums.get(window, 0.0) + g.sum(dim=0)
+            self.sq_sums[window] = self.sq_sums.get(window, 0.0) + (g**2).sum(dim=0)
+            self.counts[window] = self.counts.get(window, 0) + g.size(0)
+
+    def finish(self, min_std: float) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+        stats: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for window in self.sums:
+            n = max(self.counts[window], 1)
+            mean = self.sums[window] / n
+            var = (self.sq_sums[window] / n - mean**2).clamp_min(0.0)
+            std = var.sqrt().clamp_min(min_std)
+
+            if n < 8:
+                # Too few normals for reliable per-position spread; fall back to
+                # one pooled std so a small validation split cannot produce
+                # near-zero divisors that manufacture false positives.
+                std = torch.full_like(std, float(std.mean()))
+
+            stats[window] = (mean.float().cpu().numpy(), std.float().cpu().numpy())
+        return stats
+
+
 class AnomalyScorer:
     """Runs the masked sweep and produces heatmaps plus image scores.
 
@@ -192,7 +233,18 @@ class AnomalyScorer:
         distance: str | None = None,
         alpha: float | None = None,
         chunk: int = 16,
+        cardinality: str = "off",
+        cardinality_weight: float = 1.0,
     ):
+        if cardinality not in CARDINALITY_MODES:
+            raise ValueError(
+                f"Unknown cardinality mode '{cardinality}'. Available: {CARDINALITY_MODES}"
+            )
+        if cardinality != "off" and not getattr(model, "has_cardinality", False):
+            raise ValueError(
+                f"anomaly.cardinality={cardinality} needs a checkpoint trained with a "
+                f"cardinality head (slots.enabled=true)."
+            )
         self.model = model
         self.mask_bank = mask_bank
         self.out_size = out_size
@@ -212,7 +264,25 @@ class AnomalyScorer:
         self.distance = distance
         self.alpha = alpha
         self.chunk = chunk
+        # off  -> the JEPA latent error alone (every previously reported number)
+        # add  -> JEPA + cardinality_weight * cardinality, fused per patch
+        # only -> the cardinality channel alone, to isolate what it contributes
+        self.cardinality = cardinality
+        self.cardinality_weight = cardinality_weight
         self.calibration = Calibration()
+
+    @property
+    def uses_cardinality(self) -> bool:
+        return self.cardinality != "off"
+
+    def _grids(self, images: torch.Tensor):
+        """``(jepa_grids, card_grids_or_None)`` for a batch."""
+        kwargs = {"with_cardinality": True} if self.uses_cardinality else {}
+        out = self.model.anomaly_grids(
+            images, self.mask_bank, chunk=self.chunk,
+            distance=self.distance, alpha=self.alpha, **kwargs,
+        )
+        return out if self.uses_cardinality else (out, None)
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
@@ -225,18 +295,26 @@ class AnomalyScorer:
         """
         self.model.eval()
 
-        grids = self.model.anomaly_grids(
-            images, self.mask_bank, chunk=self.chunk,
-            distance=self.distance, alpha=self.alpha,
-        )
+        grids, card_grids = self._grids(images)
 
         def _maps(normalize: str) -> torch.Tensor:
-            return build_anomaly_map(
-                grids, out_size=self.out_size, fusion=self.fusion,
-                weights=self.weights, normalize=normalize, sigma=self.sigma,
-                scale_stats=self.calibration.scale_stats,
-                deviation=self.deviation,
-            )
+            fused = None
+            if self.cardinality != "only":
+                fused = fuse_scales(
+                    grids, mode=self.fusion, weights=self.weights,
+                    normalize=normalize, scale_stats=self.calibration.scale_stats,
+                    deviation=self.deviation,
+                )
+            if card_grids is not None:
+                # The cardinality error is |predicted - actual|, already
+                # direction-free, so it is always read as signed: "a bigger
+                # mismatch than normally occurs here".
+                card = fuse_scales(
+                    card_grids, mode="mean", normalize=normalize,
+                    scale_stats=self.calibration.card_stats, deviation="signed",
+                )
+                fused = card if fused is None else fused + self.cardinality_weight * card
+            return upsample_map(fused, out_size=self.out_size, sigma=self.sigma)
 
         # Study 4 measured that no single normalisation is best at both jobs,
         # so the two are computed separately rather than compromised into one.
@@ -257,6 +335,8 @@ class AnomalyScorer:
         }
         if return_grids:
             out["grids"] = grids
+            if card_grids is not None:
+                out["card_grids"] = card_grids
         return out
 
     @torch.no_grad()
@@ -272,7 +352,7 @@ class AnomalyScorer:
             from tqdm import tqdm
             iterator = tqdm(loader, desc="scoring", leave=False)
 
-        scores, labels, defects, maps, loc_maps, masks = [], [], [], [], [], []
+        scores, labels, defects, paths, maps, loc_maps, masks = [], [], [], [], [], [], []
 
         for batch in iterator:
             images = batch["image"].to(device, non_blocking=True)
@@ -281,6 +361,7 @@ class AnomalyScorer:
             scores.append(out["scores"].float().cpu().numpy())
             labels.append(batch["label"].numpy())
             defects.extend(batch["defect_type"])
+            paths.extend(batch.get("path", []))
 
             if collect_maps:
                 maps.append(out["detection_maps"].float().cpu().numpy())
@@ -292,6 +373,7 @@ class AnomalyScorer:
             "scores": np.concatenate(scores) if scores else np.array([]),
             "labels": np.concatenate(labels) if labels else np.array([]),
             "defect_types": np.array(defects),
+            "paths": list(paths),
         }
         if collect_maps and maps:
             result["maps"] = np.concatenate(maps)
@@ -322,38 +404,20 @@ class AnomalyScorer:
             ``{window: (mean_grid, std_grid)}`` with grids of shape (H, W).
         """
         self.model.eval()
-        sums: dict[int, torch.Tensor] = {}
-        sq_sums: dict[int, torch.Tensor] = {}
-        counts: dict[int, int] = {}
+        jepa_acc = _MomentAccumulator()
+        card_acc = _MomentAccumulator()
 
         for batch in loader:
             images = batch["image"].to(device, non_blocking=True)
-            grids = self.model.anomaly_grids(
-                images, self.mask_bank, chunk=self.chunk,
-                distance=self.distance, alpha=self.alpha,
-            )
-            for window, grid in grids.items():
-                g = grid.double()
-                sums[window] = sums.get(window, 0.0) + g.sum(dim=0)
-                sq_sums[window] = sq_sums.get(window, 0.0) + (g**2).sum(dim=0)
-                counts[window] = counts.get(window, 0) + g.size(0)
+            grids, card_grids = self._grids(images)
+            jepa_acc.add(grids)
+            if card_grids is not None:
+                card_acc.add(card_grids)
 
-        stats: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-        for window in sums:
-            n = max(counts[window], 1)
-            mean = sums[window] / n
-            var = (sq_sums[window] / n - mean**2).clamp_min(0.0)
-            std = var.sqrt().clamp_min(min_std)
-
-            if n < 8:
-                # Too few normals for reliable per-position spread; fall back to
-                # one pooled std so a small validation split cannot produce
-                # near-zero divisors that manufacture false positives.
-                std = torch.full_like(std, float(std.mean()))
-
-            stats[window] = (mean.float().cpu().numpy(), std.float().cpu().numpy())
-
-        return stats
+        # Stored on the instance rather than returned, so the return type (and
+        # every existing caller) is unchanged when cardinality is off.
+        self._fitted_card_stats = card_acc.finish(min_std)
+        return jepa_acc.finish(min_std)
 
     @torch.no_grad()
     def calibrate(self, loader, device, sigma_threshold: float = 3.0,
@@ -380,13 +444,16 @@ class AnomalyScorer:
         hand over ``validation/good`` or ``train/good``.
         """
         scale_stats = self.fit_scale_stats(stats_loader or loader, device)
+        card_stats = getattr(self, "_fitted_card_stats", {})
         self.calibration.scale_stats = scale_stats
+        self.calibration.card_stats = card_stats
 
         out = self.score_loader(loader, device, collect_maps=True)
         self.calibration = fit_calibration(
             out["scores"], out.get("maps"), sigma_threshold=sigma_threshold
         )
         self.calibration.scale_stats = scale_stats
+        self.calibration.card_stats = card_stats
         return self.calibration
 
     def predict(self, images: torch.Tensor) -> dict:
@@ -402,6 +469,15 @@ class AnomalyScorer:
             "maps": out["maps"],
             "grids": out["grids"],
         }
+
+
+def _cardinality_mode(value) -> str:
+    """YAML reads a bare ``off`` as ``False`` (and ``on`` as ``True``)."""
+    if value is False or value is None:
+        return "off"
+    if value is True:
+        return "add"
+    return str(value)
 
 
 def build_scorer(cfg, model, mask_bank) -> AnomalyScorer:
@@ -426,4 +502,6 @@ def build_scorer(cfg, model, mask_bank) -> AnomalyScorer:
         distance=node.get("distance", None),
         alpha=node.get("alpha", None),
         chunk=node.get("sweep_chunk", 16),
+        cardinality=_cardinality_mode(node.get("cardinality", "off")),
+        cardinality_weight=float(node.get("cardinality_weight", 1.0)),
     )

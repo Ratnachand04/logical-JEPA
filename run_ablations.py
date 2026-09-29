@@ -27,6 +27,14 @@ Five studies, defined in ``configs/ablations.yaml``:
     normalisation gives sharper localisation but near-chance image AUROC.
     Inference only.
 
+``hierarchical``
+    Study 8, Phase 3b: the weight of the slot-set term. Trains one model per
+    arm; every arm carries the slot stage so only lambda differs.
+
+``cardinality``
+    Study 9, Phase 3c: the cardinality channel off / added / alone, re-scoring
+    the Study 8 control checkpoint. Inference only.
+
 Usage::
 
     py -3.12 run_ablations.py --config configs/ablations.yaml --study all
@@ -63,6 +71,10 @@ REPORT_KEYS = [
     "au_pro",
     "logical_au_pro",
     "structural_au_pro",
+    # Only present when the dataset ships a subtype manifest (the synthetic
+    # set does); reported as n/a otherwise.
+    "removal_auroc",
+    "addition_auroc",
 ]
 
 
@@ -337,7 +349,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--study", default="all",
                         choices=["all", "masking", "scoring", "sweep",
                                  "normalization", "loss_reduction", "vicreg",
-                                 "deviation", "baselines"])
+                                 "deviation", "hierarchical", "cardinality",
+                                 "baselines"])
     parser.add_argument("--checkpoint", default=None,
                         help="checkpoint for the inference-only studies and PatchCore; "
                              "defaults to the multi-scale masking arm's checkpoint")
@@ -370,8 +383,8 @@ def main() -> None:
     logger.info(f"Seeds: {seeds}" + ("" if len(seeds) > 1 else
                                      "  (single seed -- results will be labelled as such)"))
 
-    studies = (["masking", "loss_reduction", "vicreg", "scoring", "sweep",
-                "normalization", "deviation", "baselines"]
+    studies = (["masking", "loss_reduction", "vicreg", "hierarchical", "scoring",
+                "sweep", "normalization", "deviation", "cardinality", "baselines"]
                if args.study == "all" else [args.study])
     all_rows: dict[str, list[dict]] = {}
 
@@ -411,11 +424,51 @@ def main() -> None:
                 arm_checkpoint_path(cfg, reference["name"], seed, seeds) for seed in seeds
             ]
 
+    # Study 9 needs a checkpoint with a cardinality head, which the masking and
+    # loss-reduction arms do not have; it re-scores the Study 8 control.
+    card_checkpoints = [args.checkpoint] if args.checkpoint else None
+
+    if "hierarchical" in studies:
+        arms = cfg.get_path("ablation.hierarchical", [])
+        csv_path = os.path.join(out_dir, "hierarchical_study.csv")
+        all_rows["Study 8: hierarchical slot loss"] = run_masking_study(
+            cfg, arms, logger, out_dir, csv_path,
+            retrain=not args.no_retrain, seeds=seeds, prefix="hierarchical",
+        )
+        if card_checkpoints is None and arms:
+            control = next((a for a in arms if a["name"].endswith("_0")), arms[0])
+            card_checkpoints = [
+                arm_checkpoint_path(cfg, control["name"], seed, seeds) for seed in seeds
+            ]
+
+    if "cardinality" in studies:
+        if card_checkpoints is None:
+            # Run on its own: reuse the Study 8 control from an earlier run.
+            hier_arms = cfg.get_path("ablation.hierarchical", [])
+            control = next((a for a in hier_arms if a["name"].endswith("_0")), None)
+            if control:
+                card_checkpoints = [
+                    arm_checkpoint_path(cfg, control["name"], seed, seeds) for seed in seeds
+                ]
+        usable = [c for c in (card_checkpoints or []) if c and os.path.isfile(c)]
+        if not usable:
+            logger.error(
+                "Study 9 (cardinality) needs a checkpoint trained with slots.enabled. "
+                "Pass --checkpoint <path>, or run --study hierarchical first."
+            )
+        else:
+            arms = cfg.get_path("ablation.cardinality", [])
+            csv_path = os.path.join(out_dir, "cardinality_study.csv")
+            all_rows["Study 9: cardinality channel"] = run_inference_study(
+                cfg, arms, usable, logger, out_dir, csv_path, "cardinality", seeds=seeds
+            )
+
     if checkpoints:
         checkpoints = [c for c in checkpoints if c and os.path.isfile(c)]
 
     if not checkpoints:
-        remaining = [s for s in studies if s != "masking"]
+        remaining = [s for s in studies
+                     if s not in ("masking", "hierarchical", "cardinality")]
         if remaining:
             logger.error(
                 f"Studies {remaining} need a trained checkpoint. Pass --checkpoint <path>, "

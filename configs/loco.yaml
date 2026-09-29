@@ -101,6 +101,32 @@ regularizer:
     cov_weight: 0.04     # decorrelate dimensions; small on purpose
     gamma: 1.0           # variance floor
 
+slots:
+  # Object-centric slot stage (Phases 3b/3c). Off by default so every number
+  # produced before it existed stays reproducible.
+  #
+  # The slot module learns its grouping from DETACHED teacher tokens by
+  # reconstruction only (the Phase 3a gate objective, now run live). The JEPA
+  # sees it through two optional channels:
+  #   hierarchical_weight  3b: slot-set term, predictions pasted into the teacher
+  #                        map vs the teacher map, compared permutation-
+  #                        invariantly (Chamfer). Slot params frozen for it.
+  #   cardinality          3c: head predicting a region's foreground mass from
+  #                        the context's sorted slot usage; stop-gradient into
+  #                        the slots. Scored with anomaly.cardinality below.
+  enabled: false
+  num_slots: 6               # Phase 3a gate: 6 had the lowest entropy ratio
+  iters: 3
+  recon_weight: 1.0
+  hierarchical_weight: 0.0   # lambda; 0 = slot term logged but not trained on
+  hierarchical_start: 0.3    # fraction of training before lambda ramps in
+  hierarchical_ramp: 0.1     # ramp length, as a fraction of training
+  cardinality:
+    enabled: true            # only meaningful when slots.enabled
+    weight: 1.0
+    hidden_dim: 128
+    pos_dim: 64
+
 train:
   epochs: 150
   batch_size: 16
@@ -156,6 +182,15 @@ anomaly:
   # Default stays `signed` because that is what every existing number was
   # produced under; see Study 7 for the measured comparison.
   deviation: signed         # signed | absolute
+
+  # Cardinality channel (Phase 3c). Needs a checkpoint trained with
+  # slots.enabled. |predicted - actual| foreground mass per window, normalised
+  # per position on normal images like the JEPA grids.
+  #   off   JEPA latent error only (every earlier number)
+  #   add   JEPA + cardinality_weight * cardinality
+  #   only  cardinality alone, to isolate its contribution
+  cardinality: "off"        # off | add | only  (quoted: bare `off` is YAML false)
+  cardinality_weight: 1.0
 
   aggregation: topk         # topk | max | mean
   top_k_ratio: 0.01
