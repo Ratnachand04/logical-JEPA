@@ -215,6 +215,24 @@ def test_build_scorer_reads_the_config(model, bank):
     assert scorer.cardinality == "add" and scorer.cardinality_weight == 0.5
 
 
+def test_checkpoint_architecture_survives_an_inherited_override(tmp_path):
+    """Study 9 crashed on this: the ablation config inherits slots.enabled=false
+    and was merged over a slot-trained checkpoint. Inference overrides must
+    still apply, but the architecture must come from the checkpoint."""
+    from evaluate import load_model_from_checkpoint
+
+    trained = build_model(_cfg())
+    path = tmp_path / "ckpt.pt"
+    torch.save({"model": trained.state_dict(), "config": _cfg().to_dict()}, path)
+
+    override = Config({"slots": {"enabled": False},
+                       "anomaly": {"cardinality": "add"}})
+    model, cfg, _ = load_model_from_checkpoint(str(path), "cpu", override)
+
+    assert model.has_cardinality
+    assert cfg.get_path("anomaly.cardinality") == "add"
+
+
 # --------------------------------------------------------------------------- #
 # Subtype breakdown
 # --------------------------------------------------------------------------- #
