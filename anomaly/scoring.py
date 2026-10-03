@@ -468,6 +468,7 @@ class AnomalyScorer:
             "confidence": np.array([self.calibration.confidence(s) for s in raw]),
             "maps": out["maps"],
             "grids": out["grids"],
+            "card_grids": out.get("card_grids"),
         }
 
 
