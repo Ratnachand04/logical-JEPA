@@ -547,7 +547,7 @@ function renderResult(r) {
   }
 
   applyView();
-  renderScales(r.scales);
+  renderScales(r.scales, r.cardinality);
 }
 
 function applyView() {
@@ -585,43 +585,54 @@ el.viewSeg.addEventListener('click', (e) => {
   applyView();
 });
 
-function renderScales(scales) {
+function scaleCard(s, cls, title, alt) {
+  const card = document.createElement('div');
+  card.className = `scale-card ${cls}`;
+
+  const img = document.createElement('img');
+  img.src = s.image;
+  img.alt = alt;
+
+  const body = document.createElement('div');
+  body.className = 'scale-body';
+
+  const head = document.createElement('div');
+  head.className = 'scale-head';
+
+  const name = document.createElement('span');
+  name.className = 'scale-name';
+  name.textContent = title;
+
+  const peak = document.createElement('span');
+  peak.className = 'scale-peak';
+  peak.textContent = `peak ${s.max.toFixed(3)}`;
+
+  const role = document.createElement('p');
+  role.className = 'scale-role';
+  role.textContent = s.role;
+
+  head.append(name, peak);
+  body.append(head, role);
+  card.append(img, body);
+  return card;
+}
+
+function renderScales(scales, cardinality) {
   el.scales.innerHTML = '';
   if (!scales) return;
 
   const windows = Object.keys(scales).map(Number).sort((a, b) => a - b);
 
   for (const w of windows) {
-    const s = scales[String(w)];
-    const card = document.createElement('div');
-    card.className = `scale-card ${w <= 3 ? 'is-small' : 'is-large'}`;
+    el.scales.appendChild(scaleCard(
+      scales[String(w)], w <= 3 ? 'is-small' : 'is-large',
+      `${w}×${w} window`, `Anomaly grid at ${w}×${w} window scale`));
+  }
 
-    const img = document.createElement('img');
-    img.src = s.image;
-    img.alt = `Anomaly grid at ${w}×${w} window scale`;
-
-    const body = document.createElement('div');
-    body.className = 'scale-body';
-
-    const head = document.createElement('div');
-    head.className = 'scale-head';
-
-    const name = document.createElement('span');
-    name.className = 'scale-name';
-    name.textContent = `${w}×${w} window`;
-
-    const peak = document.createElement('span');
-    peak.className = 'scale-peak';
-    peak.textContent = `peak ${s.max.toFixed(3)}`;
-
-    const role = document.createElement('p');
-    role.className = 'scale-role';
-    role.textContent = s.role;
-
-    head.append(name, peak);
-    body.append(head, role);
-    card.append(img, body);
-    el.scales.appendChild(card);
+  if (cardinality) {
+    el.scales.appendChild(scaleCard(
+      cardinality, 'is-cardinality', `cardinality · ${cardinality.mode}`,
+      'Cardinality mismatch: expected vs observed component mass'));
   }
 }
 

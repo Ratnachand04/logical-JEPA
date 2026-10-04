@@ -219,6 +219,28 @@ image-level score is made of.
 choice; pick `global` to decide whether an image is defective, `zscore` to show an operator
 where.
 
+### Studies 8–9 · Slots and cardinality — both negative
+
+Phase 3b added a slot-set consistency term to training; Phase 3c added a head
+that predicts how much component mass a hidden region should hold, scored as an
+extra channel. Synthetic `screw_board`, 80 epochs, **3 seeds**. Full write-up in
+[`outputs/phase3bc/SUMMARY.md`](outputs/phase3bc/SUMMARY.md).
+
+| Arm | Image AUROC | Logical | **Removal** | Pixel AUROC |
+|---|---|---|---|---|
+| baseline (λ = 0, cardinality off) | 0.806 ± 0.022 | 0.812 ± 0.030 | 0.573 ± 0.125 | **0.847** |
+| slot term λ = 0.1 | 0.783 ± 0.035 | 0.796 ± 0.038 | 0.537 ± 0.111 | 0.794 |
+| slot term λ = 0.5 | 0.717 ± 0.081 | 0.739 ± 0.060 | 0.533 ± 0.038 | 0.781 |
+| cardinality only | 0.541 ± 0.083 | 0.541 ± 0.117 | 0.509 ± 0.060 | 0.535 |
+| JEPA + cardinality | 0.792 ± 0.012 | 0.792 ± 0.005 | 0.563 ± 0.139 | 0.693 |
+| absolute deviation | **0.831 ± 0.046** | **0.829 ± 0.074** | 0.584 ± 0.194 | 0.676 |
+
+The slot term only costs as λ grows, and the cardinality channel is near chance
+on its own. The more useful result is the new **per-direction breakdown**:
+added and moved objects score ~1.0 in every arm, while **removed** objects sit at
+0.47–0.58. Phase 1's mechanism — missing content is easier to predict — is now
+measured directly by subtype, and it remains the open problem.
+
 Reproduce all of it:
 
 ```bash
@@ -447,7 +469,7 @@ project targets.
 ## Tests
 
 ```bash
-py -3.12 -m pytest tests/ -q          # 245 tests, ~14 s
+py -3.12 -m pytest tests/ -q          # 285 tests, ~35 s
 ```
 
 | file | tests | what it guards |
@@ -462,6 +484,8 @@ py -3.12 -m pytest tests/ -q          # 245 tests, ~14 s
 | `test_union_mask.py` | 16 | **union of region masks** — the highest-risk data path |
 | `test_loss_reduction.py` | 14 | per-patch vs per-block arithmetic |
 | `test_decoupled_norm.py` | 13 | detection and localization paths stay separate |
+| `test_cardinality.py` | 18 | **stop-gradient into the slots**, `off` changes nothing, subtype breakdown |
+| `test_hierarchical.py` | 13 | **slot term never trains the slot module**, permutation invariance |
 
 The bolded rows encode project *constraints* rather than ordinary correctness. They exist so
 a future change cannot quietly invalidate a research claim — a leaked anomaly in the
@@ -481,6 +505,8 @@ logical-JEPA/
 │   ├── context_encoder.py     # student: visible patches only
 │   ├── target_encoder.py      # teacher: EMA, frozen, sees everything
 │   ├── predictor.py           # narrow transformer, imagines hidden regions
+│   ├── slot_bottleneck.py     # slot attention + permutation-invariant set helpers
+│   ├── cardinality.py         # region foreground-mass head (Phase 3c)
 │   └── logical_jepa.py        # training step + masked inference sweep
 ├── masking/
 │   ├── base.py                # MaskSpec, block sampling, context complement

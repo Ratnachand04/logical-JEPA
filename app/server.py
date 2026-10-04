@@ -138,6 +138,21 @@ def run_inference(pil_image: Image.Image) -> dict:
                     else "logical (component layout)",
         }
 
+    # Cardinality channel (Phase 3c), when the scorer uses it: one card, the
+    # mismatch between expected and observed component mass, averaged over scales.
+    cardinality = None
+    if out.get("card_grids"):
+        g = torch.stack([grid[0].float() for grid in out["card_grids"].values()]).mean(0)
+        g = g.cpu().numpy()
+        big = cv2.resize(g, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+        cardinality = {
+            "image": encode_png(colorize(big)),
+            "mean": float(g.mean()),
+            "max": float(g.max()),
+            "role": "cardinality (expected vs observed component mass)",
+            "mode": scorer.cardinality,
+        }
+
     # Peak location, in pixels, for the "where" readout.
     peak = np.unravel_index(int(np.argmax(heat)), heat.shape)
 
@@ -156,6 +171,7 @@ def run_inference(pil_image: Image.Image) -> dict:
             "overlay": encode_png(overlay),
         },
         "scales": scales,
+        "cardinality": cardinality,
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
     }
 
@@ -206,6 +222,8 @@ def api_status():
             "distance": scorer.distance or model.loss_kind,
             "fusion": scorer.fusion,
             "aggregation": scorer.aggregation,
+            "deviation": scorer.deviation,
+            "cardinality": scorer.cardinality,
         },
         "calibration": scorer.calibration.to_dict(),
     })

@@ -16,6 +16,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 
 import numpy as np
@@ -36,6 +37,10 @@ from utils.logging_utils import get_logger, save_json
 from utils.seed import seed_everything
 
 
+ARCHITECTURE_KEYS = ("encoder", "predictor", "slots", "loss", "ema", "regularizer",
+                     "data.img_size", "data.patch_size")
+
+
 def load_model_from_checkpoint(path: str, device, cfg_override: Config | None = None):
     """Restore a model plus the config it was trained with.
 
@@ -44,10 +49,18 @@ def load_model_from_checkpoint(path: str, device, cfg_override: Config | None = 
     shapes, which would fail to load.
     """
     payload = torch.load(path, map_location=device, weights_only=False)
-    cfg = Config(payload["config"])
+    trained = Config(payload["config"])
+    cfg = trained
 
     if cfg_override:
-        cfg = deep_merge(cfg, cfg_override)
+        cfg = deep_merge(trained, cfg_override)
+        # Re-assert the trained architecture: an override config that merely
+        # *inherits* a different default (e.g. slots.enabled: false) must not
+        # rebuild a model the saved weights do not fit.
+        for key in ARCHITECTURE_KEYS:
+            value = trained.get_path(key, None)
+            if value is not None:
+                cfg.set_path(key, copy.deepcopy(value))
 
     model = build_model(cfg).to(device)
     model.load_state_dict(payload["model"])

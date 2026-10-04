@@ -570,6 +570,8 @@ main { padding: 1.75rem 0 3rem; }
 .scale-role { margin: .25rem 0 0; font-size: .73rem; color: var(--text-faint); }
 .scale-card.is-small .scale-name { color: var(--warn); }
 .scale-card.is-large .scale-name { color: var(--violet); }
+.scale-card.is-cardinality .scale-name { color: var(--text); }
+.scale-card:nth-child(4) { animation-delay: .35s; }
 
 /* ------------------------------------------------------------ model card */
 .cardgrid {
