@@ -91,12 +91,38 @@ than inferred from the logical aggregate. It is the open problem, and neither
 
 ## Two side findings
 
-**Low `target_std` here is not collapse.** On this setup (torch 2.14,
-GTX 1650 with emulated bf16) `target_std` settles at ~0.08–0.11 rather than the
-~0.5 the README describes, with `cos_sim` ~0.999. A plain model with no slot
-stage does the same and still scores image AUROC 0.855 / pixel 0.890 (seed 42) —
-above the README's 0.762 for this configuration — so the training-time warning
-threshold (0.05) is the right one and 0.1 is not a failure signal.
+**Low `target_std` here is not collapse — and it is not precision either
+(B5, settled).** `target_std` settles at ~0.08–0.11 rather than the ~0.5 the
+README describes, with `cos_sim` ~0.999. A plain model with no slot stage does
+the same and still scores image AUROC 0.855 / pixel 0.890 (seed 42) — above the
+README's 0.762 for this configuration — so the training-time warning threshold
+(0.05) is the right one and 0.1 is not a failure signal.
+
+This was first seen on a GTX 1650 and attributed to **emulated bf16**. That
+hypothesis has now been tested and **falsified**, on an RTX 4060 Laptop GPU
+which reports `torch.cuda.is_bf16_supported() == True` (native bf16):
+
+| epoch | `tstd_amp` (bf16) | `tstd_fp32` (`train.amp=false`) |
+|---:|---:|---:|
+| 1 | 0.4576 | 0.4574 |
+| 40 | 0.0759 | 0.0758 |
+| 80 | **0.0933** | **0.1144** |
+
+The two trajectories agree to three or four decimal places at every logged
+epoch, so disabling mixed precision changes nothing. Two independent reasons
+rule out bf16: this GPU has native bf16 and still shows ~0.1 (a third run,
+`collapse_check`, gave 0.1095), and pure fp32 shows it too. By the completion
+guide's own decision table this is the middle row — *not precision; a property
+of this torch version or run setup*.
+
+The trajectory is also **not monotone toward zero**: it falls to ~0.076 by epoch
+40 and recovers to 0.09–0.11 by epoch 80. A representation collapsing to a
+constant does not come back. On a 200-image set of near-identical synthetic
+boards, a low-variance target is the correct answer rather than a degenerate one.
+
+*What would discriminate further:* re-run the same two commands with
+`data.root=data/mvtec_loco_256`. Real LOCO normals vary far more than synthetic
+ones, so that would show whether ~0.1 is a property of the data or of the setup.
 
 **Checkpoint loading bug, fixed.** `load_model_from_checkpoint` merged the
 caller's config over the checkpoint's, so an inference-only study whose config
