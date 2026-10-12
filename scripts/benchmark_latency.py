@@ -88,7 +88,8 @@ def build_at_resolution(cfg, img_size: int, device):
     """
     resized = Config(cfg.to_dict())
     resized.set_path("data.img_size", img_size)
-    return build_model(resized).to(device).eval()
+    # Cost depends on shape, not weights, so pretrained weights are never fetched.
+    return build_model(resized, load_pretrained=False).to(device).eval()
 
 
 def parse_args() -> argparse.Namespace:
