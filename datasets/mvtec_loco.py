@@ -29,6 +29,7 @@ Two details of this benchmark drive the implementation:
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass
 
 import numpy as np
@@ -125,7 +126,19 @@ class MVTecLOCO(Dataset):
         return_mask: bool = True,
         defect_types: list[str] | None = None,
         train_augment: bool = True,
+        max_images: int | None = None,
+        subset_seed: int = 0,
     ):
+        """
+        Args (in addition to the class docstring):
+            max_images: few-shot budget. Keep only this many training images,
+                chosen by ``subset_seed``. Applies to the ``train`` split only:
+                validation and test are never thinned, so a few-shot model is
+                always measured on the full test set.
+            subset_seed: which ``max_images`` images. Fixed per run so that
+                training, calibration statistics and evaluation all see the
+                *same* few images.
+        """
         if split not in ("train", "validation", "test"):
             raise ValueError(f"split must be train/validation/test, got '{split}'")
 
@@ -158,6 +171,10 @@ class MVTecLOCO(Dataset):
             raise RuntimeError(
                 f"No images found for {category}/{split} under {self.category_dir}"
             )
+
+        self.available_images = len(self.samples)
+        if split == "train" and max_images is not None:
+            self.samples = select_few_shot(self.samples, int(max_images), subset_seed)
 
     # ------------------------------------------------------------------ #
     def _build_index(self, defect_types: list[str] | None) -> list[LocoSample]:
@@ -252,6 +269,21 @@ def available_categories(root: str) -> list[str]:
     return found
 
 
+def select_few_shot(samples: list, k: int, seed: int = 0) -> list:
+    """A reproducible ``k``-image subset of a normal training split.
+
+    Sorted first so the choice depends only on ``(k, seed)`` and the file
+    names, never on directory-listing order, which differs between machines.
+    """
+    if k < 1:
+        raise ValueError(f"num_train_images must be >= 1, got {k}")
+    if k >= len(samples):
+        return list(samples)
+    ordered = sorted(samples, key=lambda s: s.image_path)
+    picked = random.Random(seed).sample(ordered, k)
+    return sorted(picked, key=lambda s: s.image_path)
+
+
 def build_normal_loader(cfg, category: str, split: str = "train",
                         num_workers: int | None = None):
     """Deterministic, un-augmented loader over a normal-only split.
@@ -260,6 +292,10 @@ def build_normal_loader(cfg, category: str, split: str = "train",
     data. The training loader shuffles and applies colour jitter, both of which
     would add noise to a per-position mean and standard deviation, so statistics
     are fitted through this loader instead.
+
+    The ``train`` split honours the few-shot budget (``data.num_train_images``):
+    the positional statistics are fitted on exactly the images the model was
+    trained on, never on extra normals it was not allowed to see.
     """
     from torch.utils.data import DataLoader
 
@@ -270,6 +306,8 @@ def build_normal_loader(cfg, category: str, split: str = "train",
         cfg.get_path("data.img_size", 256),
         return_mask=False,
         train_augment=False,
+        max_images=cfg.get_path("data.num_train_images", None),
+        subset_seed=cfg.get_path("data.subset_seed", 0),
     )
     workers = cfg.get_path("data.num_workers", 4) if num_workers is None else num_workers
 
@@ -299,9 +337,12 @@ def build_dataloaders(cfg, category: str, num_workers: int | None = None):
     eval_batch = cfg.get_path("eval.batch_size", 8)
     workers = cfg.get_path("data.num_workers", 4) if num_workers is None else num_workers
 
+    num_train = cfg.get_path("data.num_train_images", None)
     train_set = MVTecLOCO(
         root, category, "train", img_size,
         train_augment=cfg.get_path("data.augment", True),
+        max_images=num_train,
+        subset_seed=cfg.get_path("data.subset_seed", 0),
     )
     test_set = MVTecLOCO(root, category, "test", img_size, return_mask=True)
 
@@ -314,9 +355,28 @@ def build_dataloaders(cfg, category: str, num_workers: int | None = None):
                   pin_memory=torch.cuda.is_available(),
                   persistent_workers=workers > 0)
 
-    train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=True, drop_last=True, **common
-    )
+    if num_train is not None:
+        # Few-shot: 8 images with batch 16 and drop_last would give ZERO steps
+        # per epoch. Sample with replacement instead, so an epoch is a fixed
+        # number of masked views however few images exist -- every step still
+        # draws fresh masks and fresh photometric jitter.
+        #
+        # By default an epoch is as long as a full-data epoch, so a few-shot
+        # run gets exactly the optimiser steps the full-data run gets: the
+        # budget changes how many distinct images are seen, never the compute.
+        from torch.utils.data import RandomSampler
+
+        samples = cfg.get_path("data.samples_per_epoch", None)
+        samples = int(samples) if samples is not None else train_set.available_images
+        samples = max(samples, batch_size)       # never an empty epoch
+        sampler = RandomSampler(train_set, replacement=True, num_samples=samples)
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, sampler=sampler, drop_last=True, **common
+        )
+    else:
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, shuffle=True, drop_last=True, **common
+        )
     test_loader = DataLoader(test_set, batch_size=eval_batch, shuffle=False, **common)
     val_loader = (
         DataLoader(val_set, batch_size=eval_batch, shuffle=False, **common)
