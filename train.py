@@ -129,10 +129,23 @@ def train(cfg, logger) -> str:
 
     # ---- data -------------------------------------------------------- #
     train_loader, _val_loader, _test_loader = build_dataloaders(cfg, category)
-    logger.info(f"Category '{category}': {len(train_loader.dataset)} normal training images")
+    train_set = train_loader.dataset
+    if len(train_set) < getattr(train_set, "available_images", len(train_set)):
+        logger.info(
+            f"Category '{category}': FEW-SHOT -- {len(train_set)} of "
+            f"{train_set.available_images} normal training images "
+            f"(subset_seed={cfg.get_path('data.subset_seed', 0)}), "
+            f"{len(train_loader)} steps/epoch"
+        )
+    else:
+        logger.info(f"Category '{category}': {len(train_set)} normal training images")
 
     # ---- model ------------------------------------------------------- #
     model = build_model(cfg).to(device)
+    if model.pretrained_report:
+        r = model.pretrained_report
+        logger.info(f"Pretrained encoder '{r['name']}': {r['tensors_loaded']} tensors "
+                    f"loaded, positions {r['pos_grid']}")
     logger.info(model.describe())
 
     mask_gen = build_mask_generator(
