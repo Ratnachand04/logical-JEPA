@@ -196,6 +196,8 @@ def api_status():
 
     encoder = model.context_encoder.num_parameters()
     predictor = model.predictor.num_parameters()
+    trainable = sum(p.numel() for p in model.trainable_parameters())
+    train_images = cfg.get_path("data.num_train_images", None)
 
     return jsonify({
         "ready": True,
@@ -210,7 +212,11 @@ def api_status():
             "embed_dim": model.embed_dim,
             "encoder_params": encoder,
             "predictor_params": predictor,
-            "trainable_params": encoder + predictor,
+            "trainable_params": trainable,
+            # Few-shot models: where the encoder started and what was adapted.
+            "pretrained": model.pretrained,
+            "finetune": model.finetune,
+            "train_images": train_images,
         },
         "masking": {
             "strategy": cfg.get_path("masking.strategy"),
