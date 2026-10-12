@@ -45,6 +45,7 @@ const el = {
   scales:       $('scales'),
   cardgrid:     $('cardgrid'),
   calibNote:    $('calib-note'),
+  footerModel:  $('footer-model'),
 
   sweepGrid:    $('sweep-grid'),
 };
@@ -210,12 +211,14 @@ function renderHeader(s) {
     { text: s.device, cls: 'chip' },
     { text: `${s.model.trainable_params >= 1e6
               ? (s.model.trainable_params / 1e6).toFixed(1) + 'M'
-              : s.model.trainable_params} params`, cls: 'chip' },
+              : s.model.trainable_params} trained params`, cls: 'chip' },
     {
       text: s.calibrated ? 'calibrated' : 'uncalibrated',
       cls: s.calibrated ? 'chip chip-ok' : 'chip chip-bad',
     },
   ];
+
+  if (s.model.pretrained) chips.splice(2, 0, { text: initLabel(s.model), cls: 'chip' });
 
   el.headerMeta.innerHTML = '';
   for (const c of chips) {
@@ -226,14 +229,27 @@ function renderHeader(s) {
   }
 }
 
+// "DINO ViT-S/16 · 16-shot" for a few-shot model; null for one built from scratch.
+function initLabel(m) {
+  if (!m.pretrained) return null;
+  const name = m.pretrained.replace(/^dino_vit(\w)(\d+)$/, (_, size, p) => `DINO ViT-${size.toUpperCase()}/${p}`);
+  return m.train_images ? `${name} · ${m.train_images}-shot` : name;
+}
+
 function renderModelCard(s) {
+  const m = s.model;
   const rows = [
     ['Category',        s.category],
+    ['Encoder init',    m.pretrained
+                          ? `${initLabel(m)} (${m.finetune})`
+                          : 'random — trained from scratch'],
+    ['Training images', m.train_images ? `${fmtInt(m.train_images)} normal` : 'full normal split'],
     ['Patch grid',      `${s.model.grid} @ ${s.model.patch_size}px`],
     ['Input size',      `${s.model.img_size}×${s.model.img_size}`],
     ['Embedding dim',   s.model.embed_dim],
     ['Context encoder', `${fmtParams(s.model.encoder_params)} params`],
     ['Predictor',       `${fmtParams(s.model.predictor_params)} params`],
+    ['Trained params',  fmtParams(s.model.trainable_params)],
     ['Training masks',  `${s.masking.strategy}${s.masking.mode ? ` / ${s.masking.mode}` : ''}`],
     ['Sweep windows',   s.inference.sweep_windows.map((w) => `${w}×${w}`).join(', ')],
     ['Sweep configs',   `${fmtInt(s.inference.sweep_configs)} per image`],
@@ -252,6 +268,12 @@ function renderModelCard(s) {
     div.append(kEl, vEl);
     el.cardgrid.appendChild(div);
   }
+
+  el.footerModel.textContent = m.pretrained
+    ? `encoder initialised from ${initLabel(m)}, self-supervised (no labels), `
+      + `${m.finetune === 'frozen' ? 'kept frozen' : `finetune: ${m.finetune}`}; `
+      + `the JEPA predictor trained on ${m.train_images ? `${m.train_images} normal images` : 'the normal split'}.`
+    : 'trained from scratch in PyTorch, no pretrained backbone.';
 
   const c = s.calibration;
   el.calibNote.textContent = s.calibrated
