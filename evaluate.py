@@ -40,6 +40,13 @@ from utils.seed import seed_everything
 ARCHITECTURE_KEYS = ("encoder", "predictor", "slots", "loss", "ema", "regularizer",
                      "data.img_size", "data.patch_size")
 
+# Which normal images the model was allowed to see. These travel with the
+# checkpoint for the same reason the architecture does: evaluating a few-shot
+# model with a config that merely *inherits* `num_train_images: null` would fit
+# the per-position calibration statistics on every training image, quietly
+# breaking the few-shot budget the model was trained under.
+TRAINING_DATA_KEYS = ("data.num_train_images", "data.subset_seed")
+
 
 def load_model_from_checkpoint(path: str, device, cfg_override: Config | None = None):
     """Restore a model plus the config it was trained with.
@@ -61,8 +68,14 @@ def load_model_from_checkpoint(path: str, device, cfg_override: Config | None = 
             value = trained.get_path(key, None)
             if value is not None:
                 cfg.set_path(key, copy.deepcopy(value))
+        # Unlike architecture, `None` is meaningful here ("all images"), so the
+        # trained value is restored even when it is None.
+        for key in TRAINING_DATA_KEYS:
+            cfg.set_path(key, copy.deepcopy(trained.get_path(key, None)))
 
-    model = build_model(cfg).to(device)
+    # The state dict holds every weight, pretrained positions included, so the
+    # pretrained checkpoint is never re-downloaded just to be overwritten.
+    model = build_model(cfg, load_pretrained=False).to(device)
     model.load_state_dict(payload["model"])
     model.eval()
 
