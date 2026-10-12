@@ -1,6 +1,6 @@
 """Run the Logical-JEPA ablation studies and emit the results tables.
 
-Five studies, defined in ``configs/ablations.yaml``:
+The studies, defined in ``configs/ablations.yaml``:
 
 ``masking``
     The headline study. Trains one model per masking strategy -- random-patch,
@@ -35,10 +35,16 @@ Five studies, defined in ``configs/ablations.yaml``:
     Study 9, Phase 3c: the cardinality channel off / added / alone, re-scoring
     the Study 8 control checkpoint. Inference only.
 
+``fewshot``
+    Study 10: a pretrained (DINO) encoder trained on a handful of normal
+    images against the from-scratch model on every image. Trains one model
+    per arm; each seed draws its own image subset.
+
 Usage::
 
     py -3.12 run_ablations.py --config configs/ablations.yaml --study all
     py -3.12 run_ablations.py --study scoring --checkpoint <path>   # no training
+    py -3.12 run_ablations.py --study fewshot --seeds 0,1,2 --arms fs_dino_k16,fs_scratch_all
 """
 
 from __future__ import annotations
@@ -115,6 +121,13 @@ def _seeded_cfg(cfg, arm, study: str | None, seed: int, seeds: list[int]):
     """Config for one (arm, seed) pair, with the experiment name namespaced."""
     arm_cfg = apply_overrides(cfg, arm.get("overrides", {}))
     arm_cfg.set_path("experiment.seed", seed)
+
+    # A few-shot arm draws a different image subset per seed, so the reported
+    # spread covers WHICH images were picked, not only training noise. An arm
+    # that pins `data.subset_seed` itself keeps it.
+    if (arm_cfg.get_path("data.num_train_images", None) is not None
+            and "data.subset_seed" not in (arm.get("overrides") or {})):
+        arm_cfg.set_path("data.subset_seed", seed)
 
     parts = [cfg.get_path("experiment.name")]
     if study:
@@ -350,7 +363,7 @@ def parse_args() -> argparse.Namespace:
                         choices=["all", "masking", "scoring", "sweep",
                                  "normalization", "loss_reduction", "vicreg",
                                  "deviation", "hierarchical", "cardinality",
-                                 "baselines"])
+                                 "fewshot", "baselines"])
     parser.add_argument("--checkpoint", default=None,
                         help="checkpoint for the inference-only studies and PatchCore; "
                              "defaults to the multi-scale masking arm's checkpoint")
@@ -360,8 +373,24 @@ def parse_args() -> argparse.Namespace:
                              "reported as mean +/- std; a single seed is labelled as such")
     parser.add_argument("--no-retrain", action="store_true",
                         help="reuse existing masking-arm checkpoints when present")
+    parser.add_argument("--arms", default=None,
+                        help="comma list of arm names to run (default: every arm). "
+                             "Lets a long training study be split into chunks; each "
+                             "arm's results are saved on their own")
     parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE")
     return parser.parse_args()
+
+
+def select_arms(arms: list[dict], names: str | None) -> list[dict]:
+    """Restrict a study to the named arms, refusing names that do not exist."""
+    if not names:
+        return arms
+    wanted = [n.strip() for n in names.split(",") if n.strip()]
+    known = {a["name"] for a in arms}
+    unknown = [n for n in wanted if n not in known]
+    if unknown:
+        raise SystemExit(f"Unknown arm(s) {unknown}. Available: {sorted(known)}")
+    return [a for a in arms if a["name"] in wanted]
 
 
 def main() -> None:
@@ -384,7 +413,8 @@ def main() -> None:
                                      "  (single seed -- results will be labelled as such)"))
 
     studies = (["masking", "loss_reduction", "vicreg", "hierarchical", "scoring",
-                "sweep", "normalization", "deviation", "cardinality", "baselines"]
+                "sweep", "normalization", "deviation", "cardinality", "fewshot",
+                "baselines"]
                if args.study == "all" else [args.study])
     all_rows: dict[str, list[dict]] = {}
 
@@ -392,7 +422,7 @@ def main() -> None:
     checkpoints = [args.checkpoint] if args.checkpoint else None
 
     if "masking" in studies:
-        arms = cfg.get_path("ablation.masking", [])
+        arms = select_arms(cfg.get_path("ablation.masking", []), args.arms)
         csv_path = os.path.join(out_dir, "masking_study.csv")
         all_rows["Study 1: masking strategy"] = run_masking_study(
             cfg, arms, logger, out_dir, csv_path,
@@ -401,7 +431,7 @@ def main() -> None:
 
     if "vicreg" in studies:
         # Trains one model per arm, like Studies 1 and 5.
-        arms = cfg.get_path("ablation.vicreg", [])
+        arms = select_arms(cfg.get_path("ablation.vicreg", []), args.arms)
         csv_path = os.path.join(out_dir, "vicreg_study.csv")
         all_rows["Study 6: VICReg collapse regulariser"] = run_masking_study(
             cfg, arms, logger, out_dir, csv_path,
@@ -410,7 +440,7 @@ def main() -> None:
 
     if "loss_reduction" in studies:
         # Trains one model per arm, so it uses the same path as Study 1.
-        arms = cfg.get_path("ablation.loss_reduction", [])
+        arms = select_arms(cfg.get_path("ablation.loss_reduction", []), args.arms)
         csv_path = os.path.join(out_dir, "loss_reduction_study.csv")
         all_rows["Study 5: loss reduction"] = run_masking_study(
             cfg, arms, logger, out_dir, csv_path,
@@ -424,12 +454,22 @@ def main() -> None:
                 arm_checkpoint_path(cfg, reference["name"], seed, seeds) for seed in seeds
             ]
 
+    if "fewshot" in studies:
+        # Trains one model per arm. Its checkpoints are not reused by the
+        # inference studies: the arms differ in encoder and data budget.
+        arms = select_arms(cfg.get_path("ablation.fewshot", []), args.arms)
+        csv_path = os.path.join(out_dir, "fewshot_study.csv")
+        all_rows["Study 10: few-shot, pretrained encoder"] = run_masking_study(
+            cfg, arms, logger, out_dir, csv_path,
+            retrain=not args.no_retrain, seeds=seeds, prefix="fewshot",
+        )
+
     # Study 9 needs a checkpoint with a cardinality head, which the masking and
     # loss-reduction arms do not have; it re-scores the Study 8 control.
     card_checkpoints = [args.checkpoint] if args.checkpoint else None
 
     if "hierarchical" in studies:
-        arms = cfg.get_path("ablation.hierarchical", [])
+        arms = select_arms(cfg.get_path("ablation.hierarchical", []), args.arms)
         csv_path = os.path.join(out_dir, "hierarchical_study.csv")
         all_rows["Study 8: hierarchical slot loss"] = run_masking_study(
             cfg, arms, logger, out_dir, csv_path,
@@ -468,7 +508,7 @@ def main() -> None:
 
     if not checkpoints:
         remaining = [s for s in studies
-                     if s not in ("masking", "hierarchical", "cardinality")]
+                     if s not in ("masking", "hierarchical", "cardinality", "fewshot")]
         if remaining:
             logger.error(
                 f"Studies {remaining} need a trained checkpoint. Pass --checkpoint <path>, "
