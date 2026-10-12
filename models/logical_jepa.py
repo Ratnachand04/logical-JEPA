@@ -32,6 +32,7 @@ from anomaly.embedding_error import jepa_loss, patch_distance
 
 from .cardinality import CardinalityHead
 from .context_encoder import ContextEncoder, build_context_encoder
+from .pretrained import apply_finetune_mode, load_pretrained_into
 from .patch_embed import gather_tokens
 from .predictor import JEPAPredictor, build_predictor
 from .slot_bottleneck import (
@@ -69,6 +70,7 @@ class LogicalJEPA(nn.Module):
         ema_cfg: dict | None = None,
         regularizer_cfg: dict | None = None,
         slots_cfg: dict | None = None,
+        load_pretrained: bool = True,
     ):
         super().__init__()
         encoder_cfg = dict(encoder_cfg or {})
@@ -82,6 +84,19 @@ class LogicalJEPA(nn.Module):
         self.embed_dim = self.context_encoder.embed_dim
         self.img_size = self.context_encoder.patch_embed.img_size
         self.patch_size = self.context_encoder.patch_embed.patch_size
+
+        # Optional pretrained initialisation. Must happen BEFORE the EMA teacher
+        # is created below, because the teacher starts as a copy of the student.
+        # `load_pretrained=False` is for rebuilding from a saved checkpoint: the
+        # state dict already carries every weight, so no download is needed.
+        self.pretrained = encoder_cfg.get("pretrained", None) or None
+        self.pretrained_report: dict | None = None
+        if self.pretrained and load_pretrained:
+            self.pretrained_report = load_pretrained_into(self.context_encoder,
+                                                          self.pretrained)
+        self.finetune = encoder_cfg.get("finetune", "frozen" if self.pretrained else "full")
+        self.finetune_last_k = int(encoder_cfg.get("finetune_last_k", 2))
+        apply_finetune_mode(self.context_encoder, self.finetune, self.finetune_last_k)
 
         self.predictor: JEPAPredictor = build_predictor(
             predictor_cfg, embed_dim=self.embed_dim, grid_size=self.grid_size
@@ -285,8 +300,13 @@ class LogicalJEPA(nn.Module):
         return self.target_encoder.update(self.context_encoder, momentum)
 
     def trainable_parameters(self):
-        """Student + predictor parameters (the teacher is excluded by design)."""
-        return list(self.context_encoder.parameters()) + list(self.predictor.parameters())
+        """Student + predictor parameters that actually train.
+
+        The teacher is excluded by design; a frozen pretrained encoder is
+        excluded because it has nothing to learn.
+        """
+        params = list(self.context_encoder.parameters()) + list(self.predictor.parameters())
+        return [p for p in params if p.requires_grad]
 
     # ------------------------------------------------------------------ #
     # Inference: masked sweep
@@ -487,11 +507,15 @@ class LogicalJEPA(nn.Module):
     def describe(self) -> str:
         ctx = self.context_encoder.num_parameters()
         pred = self.predictor.num_parameters()
+        trainable = sum(p.numel() for p in self.trainable_parameters())
         text = (
             f"LogicalJEPA(grid={self.grid_size}x{self.grid_size}, dim={self.embed_dim}, "
             f"encoder={ctx/1e6:.2f}M, predictor={pred/1e6:.2f}M, "
-            f"trainable={(ctx+pred)/1e6:.2f}M, teacher={self.target_encoder.num_parameters()/1e6:.2f}M frozen)"
+            f"trainable={trainable/1e6:.2f}M, teacher={self.target_encoder.num_parameters()/1e6:.2f}M frozen)"
         )
+        if self.pretrained:
+            text += f"\n  + encoder initialised from {self.pretrained} ({self.finetune}"
+            text += f", last {self.finetune_last_k} blocks)" if self.finetune == "last_k" else ")"
         if self.slots is not None:
             text += (
                 f"\n  + {self.slots.describe()}, hierarchical lambda={self.hier_weight} "
@@ -502,8 +526,15 @@ class LogicalJEPA(nn.Module):
         return text
 
 
-def build_model(cfg) -> LogicalJEPA:
-    """Build a :class:`LogicalJEPA` from the top-level config."""
+def build_model(cfg, load_pretrained: bool = True) -> LogicalJEPA:
+    """Build a :class:`LogicalJEPA` from the top-level config.
+
+    Args:
+        cfg: top-level config.
+        load_pretrained: fetch and load ``encoder.pretrained`` weights. Pass
+            ``False`` when a checkpoint's state dict will be loaded straight
+            after -- it already holds every weight, positions included.
+    """
     encoder_cfg = dict(cfg.get("encoder", {}))
     # The encoders need to know the image geometry, which lives under `data`.
     encoder_cfg.setdefault("img_size", cfg.get_path("data.img_size", 256))
@@ -516,4 +547,5 @@ def build_model(cfg) -> LogicalJEPA:
         ema_cfg=cfg.get("ema", {}),
         regularizer_cfg=cfg.get("regularizer", {}),
         slots_cfg=cfg.get("slots", {}),
+        load_pretrained=load_pretrained,
     )
