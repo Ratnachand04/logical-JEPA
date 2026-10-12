@@ -351,3 +351,93 @@ ablation:
       overrides:
         anomaly.cardinality: add
         anomaly.deviation: absolute
+
+  # ---------------------------------------------------------------- #
+  # Study 10 -- few-shot training with a pretrained encoder
+  #             (trains one model per arm)
+  #
+  # The claim under test: initialised from a self-supervised checkpoint
+  # (DINO ViT-S/16, see models/pretrained.py), the same JEPA trained on a
+  # handful of normal images matches or beats the from-scratch model trained
+  # on every image.
+  #
+  # Every arm runs the same schedule and the same number of optimiser steps
+  # (a few-shot epoch defaults to a full-data epoch's length), so arms differ
+  # only in the encoder's starting weights and in how many DISTINCT normal
+  # images it may see. Each seed draws a different subset (subset_seed follows
+  # the seed), so the spread includes which images were picked.
+  #
+  # The 2x2 core separates the two effects:
+  #                  every image      16 images
+  #   from scratch   fs_scratch_all   fs_scratch_k16
+  #   DINO, frozen   fs_dino_all      fs_dino_k16
+  #
+  # Reading the result:
+  #   fs_dino_k16 >= fs_scratch_all       -> the few-shot model replaces the
+  #                                          from-scratch one
+  #   fs_scratch_k16 << fs_scratch_all    -> scratch genuinely needs the data,
+  #                                          so the pretrained init is what
+  #                                          makes few-shot possible
+  #   fs_dino_k4..k32 flat                -> the budget can go lower still
+  #   fs_dino_last2_k16 < fs_dino_k16     -> adapting the encoder on so few
+  #                                          images overfits; keep it frozen
+  # ---------------------------------------------------------------- #
+  fewshot:
+    - name: fs_scratch_all
+      description: From scratch, every training image (the original model)
+      overrides:
+        encoder.pretrained: null
+
+    - name: fs_scratch_k16
+      description: From scratch, 16 training images
+      overrides:
+        encoder.pretrained: null
+        data.num_train_images: 16
+
+    - name: fs_dino_all
+      description: DINO ViT-S/16 frozen, every training image
+      overrides:
+        encoder.pretrained: dino_vits16
+        encoder.finetune: frozen
+        encoder.drop_path_rate: 0.0
+
+    - name: fs_dino_k4
+      description: DINO ViT-S/16 frozen, 4 training images
+      overrides:
+        encoder.pretrained: dino_vits16
+        encoder.finetune: frozen
+        encoder.drop_path_rate: 0.0
+        data.num_train_images: 4
+
+    - name: fs_dino_k8
+      description: DINO ViT-S/16 frozen, 8 training images
+      overrides:
+        encoder.pretrained: dino_vits16
+        encoder.finetune: frozen
+        encoder.drop_path_rate: 0.0
+        data.num_train_images: 8
+
+    - name: fs_dino_k16
+      description: DINO ViT-S/16 frozen, 16 training images (configs/fewshot.yaml)
+      overrides:
+        encoder.pretrained: dino_vits16
+        encoder.finetune: frozen
+        encoder.drop_path_rate: 0.0
+        data.num_train_images: 16
+
+    - name: fs_dino_k32
+      description: DINO ViT-S/16 frozen, 32 training images
+      overrides:
+        encoder.pretrained: dino_vits16
+        encoder.finetune: frozen
+        encoder.drop_path_rate: 0.0
+        data.num_train_images: 32
+
+    - name: fs_dino_last2_k16
+      description: DINO ViT-S/16, last 2 blocks adapted, 16 training images
+      overrides:
+        encoder.pretrained: dino_vits16
+        encoder.finetune: last_k
+        encoder.finetune_last_k: 2
+        encoder.drop_path_rate: 0.0
+        data.num_train_images: 16
