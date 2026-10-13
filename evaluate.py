@@ -113,6 +113,8 @@ def evaluate(cfg, checkpoint: str, logger, save_arrays: bool = False) -> dict:
         f"aggregation={scorer.aggregation} deviation={scorer.deviation} "
         f"cardinality={scorer.cardinality}"
         + (f" (weight {scorer.cardinality_weight})" if scorer.uses_cardinality else "")
+        + f" memory={scorer.memory}"
+        + (f" (weight {scorer.memory_weight})" if scorer.memory == "add" else "")
     )
 
     # ---- calibration on NORMAL images only --------------------------- #
@@ -134,6 +136,9 @@ def evaluate(cfg, checkpoint: str, logger, save_arrays: bool = False) -> dict:
         f"(positional stats from {len(stats_loader.dataset)} train normals): "
         f"mean={calib.score_mean:.4f} std={calib.score_std:.4f} threshold={calib.threshold:.4f}"
     )
+    if scorer.uses_memory:
+        logger.info(f"Memory bank: {scorer.memory_bank.size(0)} patches from "
+                    f"{len(scorer.memory_paths)} normal training images")
 
     # ---- score the test split ---------------------------------------- #
     out = scorer.score_loader(test_loader, device, collect_maps=True, progress=True)
@@ -151,6 +156,7 @@ def evaluate(cfg, checkpoint: str, logger, save_arrays: bool = False) -> dict:
     results["normalize_detection"] = scorer.normalize_detection
     results["normalize_localization"] = scorer.normalize_localization
     results["cardinality"] = scorer.cardinality
+    results["memory"] = scorer.memory
     results["deviation"] = scorer.deviation
 
     manifest = load_subtype_manifest(
@@ -206,6 +212,11 @@ def evaluate(cfg, checkpoint: str, logger, save_arrays: bool = False) -> dict:
     # threshold without re-running evaluation.
     save_json(calib.to_dict(),
               os.path.join(os.path.dirname(checkpoint), "calibration.json"))
+    if scorer.uses_memory:
+        # The bank is part of the fitted state the demo needs, like the
+        # calibration: the teacher features of the K normal training images.
+        torch.save(scorer.memory_state(),
+                   os.path.join(os.path.dirname(checkpoint), "memory_bank.pt"))
 
     if save_arrays:
         np.savez_compressed(
