@@ -40,6 +40,11 @@ The studies, defined in ``configs/ablations.yaml``:
     images against the from-scratch model on every image. Trains one model
     per arm; each seed draws its own image subset.
 
+``memory``
+    Study 11: a memory-bank channel on the JEPA teacher's features, off /
+    added / alone, re-scoring the Study 10 ``fs_dino_k16`` checkpoints.
+    Inference only.
+
 Usage::
 
     py -3.12 run_ablations.py --config configs/ablations.yaml --study all
@@ -363,7 +368,7 @@ def parse_args() -> argparse.Namespace:
                         choices=["all", "masking", "scoring", "sweep",
                                  "normalization", "loss_reduction", "vicreg",
                                  "deviation", "hierarchical", "cardinality",
-                                 "fewshot", "baselines"])
+                                 "fewshot", "memory", "baselines"])
     parser.add_argument("--checkpoint", default=None,
                         help="checkpoint for the inference-only studies and PatchCore; "
                              "defaults to the multi-scale masking arm's checkpoint")
@@ -414,7 +419,7 @@ def main() -> None:
 
     studies = (["masking", "loss_reduction", "vicreg", "hierarchical", "scoring",
                 "sweep", "normalization", "deviation", "cardinality", "fewshot",
-                "baselines"]
+                "memory", "baselines"]
                if args.study == "all" else [args.study])
     all_rows: dict[str, list[dict]] = {}
 
@@ -464,6 +469,26 @@ def main() -> None:
             retrain=not args.no_retrain, seeds=seeds, prefix="fewshot",
         )
 
+    # Study 11 re-scores the few-shot model Study 10 trained, one checkpoint
+    # per seed, so each seed keeps the image subset it was trained on.
+    if "memory" in studies:
+        mem_checkpoints = [args.checkpoint] if args.checkpoint else [
+            arm_checkpoint_path(cfg, "fs_dino_k16", seed, seeds) for seed in seeds
+        ]
+        usable = [c for c in mem_checkpoints if c and os.path.isfile(c)]
+        if len(usable) != len(mem_checkpoints):
+            logger.error(
+                f"Study 11 (memory) needs the Study 10 fs_dino_k16 checkpoints "
+                f"{mem_checkpoints}. Run --study fewshot --arms fs_dino_k16 with the same "
+                f"--seeds and experiment.name first, or pass --checkpoint <path>."
+            )
+        else:
+            arms = select_arms(cfg.get_path("ablation.memory", []), args.arms)
+            csv_path = os.path.join(out_dir, "memory_study.csv")
+            all_rows["Study 11: memory-bank channel"] = run_inference_study(
+                cfg, arms, usable, logger, out_dir, csv_path, "memory", seeds=seeds
+            )
+
     # Study 9 needs a checkpoint with a cardinality head, which the masking and
     # loss-reduction arms do not have; it re-scores the Study 8 control.
     card_checkpoints = [args.checkpoint] if args.checkpoint else None
@@ -508,7 +533,8 @@ def main() -> None:
 
     if not checkpoints:
         remaining = [s for s in studies
-                     if s not in ("masking", "hierarchical", "cardinality", "fewshot")]
+                     if s not in ("masking", "hierarchical", "cardinality", "fewshot",
+                                  "memory")]
         if remaining:
             logger.error(
                 f"Studies {remaining} need a trained checkpoint. Pass --checkpoint <path>, "
