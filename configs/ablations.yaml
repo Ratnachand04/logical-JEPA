@@ -441,3 +441,39 @@ ablation:
         encoder.finetune_last_k: 2
         encoder.drop_path_rate: 0.0
         data.num_train_images: 16
+
+  # ---------------------------------------------------------------- #
+  # Study 11 -- memory-bank channel (inference only)
+  #
+  # Re-scores the Study 10 fs_dino_k16 checkpoints, one per seed. Motivated by
+  # a measured gap: on real LOCO, a nearest-neighbour score on the frozen DINO
+  # features of the same 16 images beat the JEPA prediction error built on
+  # them (scripts/diagnose_fewshot.py). The bank holds the teacher features of
+  # exactly the K training images -- no other normal image is used.
+  #
+  # The weight is fixed at 1 in advance (both channels are in z-units), not
+  # chosen on the test set. mem_add is the shipped configs/fewshot.yaml and
+  # runs last, so the calibration left beside each checkpoint is the shipped one.
+  #
+  # Reading the result:
+  #   mem_add > mem_off   -> the appearance channel adds what context
+  #                          prediction misses; ship it with the JEPA
+  #   mem_only > mem_add  -> on these features the JEPA term costs accuracy;
+  #                          report it, the predictor is the weak link
+  # ---------------------------------------------------------------- #
+  memory:
+    - name: mem_off
+      description: JEPA prediction error only (Study 10 as evaluated)
+      overrides:
+        anomaly.memory: "off"
+
+    - name: mem_only
+      description: Memory bank alone -- isolates what the JEPA term contributes
+      overrides:
+        anomaly.memory: only
+
+    - name: mem_add
+      description: JEPA error + memory bank (weight 1, fixed in advance)
+      overrides:
+        anomaly.memory: add
+        anomaly.memory_weight: 1.0
