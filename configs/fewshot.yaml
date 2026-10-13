@@ -1,0 +1,79 @@
+# ===========================================================================
+# Logical-JEPA -- FEW-SHOT, PRETRAINED configuration
+#
+#   py -3.12 train.py --config configs/fewshot.yaml
+#   py -3.12 train.py --config configs/fewshot.yaml --set data.num_train_images=8
+#
+# Same JEPA as configs/loco.yaml -- masking, predictor, EMA teacher, the
+# exhaustive sweep and calibration are all inherited unchanged. Three things
+# differ:
+#
+#   1. The encoder starts from a self-supervised pretrained ViT (DINO ViT-S/16)
+#      instead of random weights.
+#   2. Training sees only `data.num_train_images` normal images.
+#   3. The score adds a memory-bank channel built from those same images.
+#
+# Everything else in loco.yaml applies. The from-scratch model there remains
+# the comparison arm and every number it produced still reproduces.
+# ===========================================================================
+
+_base_: loco.yaml
+
+experiment:
+  name: fewshot_dino
+
+data:
+  # The few-shot budget: how many normal images the model may train on.
+  # Chosen reproducibly by `subset_seed`, and used for BOTH training and the
+  # per-position calibration statistics -- never more images than this.
+  # Validation normals are still used to place the decision threshold, as in
+  # every other configuration; test images are never thinned.
+  num_train_images: 16
+  subset_seed: 0
+  # The few images are sampled with replacement. Left unset, an epoch is as
+  # long as a full-data epoch, so few-shot training gets exactly the steps a
+  # full-data run gets -- only the number of distinct images differs.
+  samples_per_epoch: null
+  # Pretrained features are robust to lighting already; keep the photometric
+  # jitter (it is free augmentation for so few images) but nothing geometric.
+  augment: true
+  num_workers: 2           # memory headroom: each worker is a full process
+
+encoder:
+  # dino_vits16 | dino_vitb16 | null (from scratch)
+  # The architecture (dim 384, depth 12, 6 heads) comes from the checkpoint;
+  # embed_dim / depth / num_heads inherited from loco.yaml are ignored.
+  pretrained: dino_vits16
+  # frozen  encoder fixed, only the predictor (~1.4M params) trains.
+  #         The right choice for a handful of images: too few parameters to
+  #         memorise them, and the pretrained features stay intact.
+  # last_k  also adapt the last `finetune_last_k` blocks.
+  # full    adapt everything (the from-scratch behaviour).
+  finetune: frozen
+  finetune_last_k: 2
+  drop_path_rate: 0.0      # stochastic depth would randomly drop pretrained blocks
+
+anomaly:
+  # The JEPA error plus a memory bank of the teacher's features of the same K
+  # training images (Study 11). It beat the JEPA error alone on every seed of
+  # both real categories measured. `only` -- the memory bank without the JEPA
+  # term -- scored higher still (outputs/fewshot/SUMMARY.md) but drops the
+  # predictor from the score; `off` reproduces Study 10.
+  memory: add
+  memory_weight: 1.0
+
+predictor:
+  predictor_dim: 192
+  depth: 3
+  num_heads: 8
+
+train:
+  # The schedule Study 10 measured this configuration under (the ablation
+  # schedule), so the numbers in outputs/fewshot/SUMMARY.md reproduce from
+  # this file alone.
+  epochs: 80
+  warmup_epochs: 8
+  batch_size: 16
+  lr: 0.001
+  log_interval: 10
+  save_interval: 0
