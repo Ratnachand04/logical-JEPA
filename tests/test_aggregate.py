@@ -185,3 +185,24 @@ def test_single_seed_comparison_flags_the_missing_spread():
 
 def test_comparison_handles_empty_input():
     assert "insufficient" in compare_arms("A", SeedStat("m", []), "B", SeedStat("m", [1.0]))
+
+
+def test_a_significance_line_can_be_logged_to_a_cp1252_console(monkeypatch):
+    """Windows consoles cannot encode "σ"; logging it must not raise mid-study."""
+    import io
+
+    from utils.logging_utils import get_logger
+
+    buffer = io.BytesIO()
+    console = io.TextIOWrapper(buffer, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", console)
+
+    a, b = SeedStat("m", [0.90, 0.91, 0.92]), SeedStat("m", [0.50, 0.51, 0.52])
+    errors = []
+    logger = get_logger("cp1252_console_test")
+    monkeypatch.setattr(logger.handlers[0], "handleError", errors.append)
+    logger.info(compare_arms("A", a, "B", b))
+    console.flush()
+
+    assert not errors
+    assert b"of seed noise" in buffer.getvalue()
