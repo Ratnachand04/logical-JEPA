@@ -25,6 +25,14 @@ def get_logger(name: str = "logical_jepa", log_file: str | None = None,
     logger.setLevel(level)
     logger.propagate = False
 
+    # A Windows console, or stdout redirected to a file, is usually cp1252,
+    # which cannot encode the "σ" in the significance lines. Replace such
+    # characters rather than let a log call raise mid-study.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     stream = logging.StreamHandler(sys.stdout)
     stream.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
     logger.addHandler(stream)
