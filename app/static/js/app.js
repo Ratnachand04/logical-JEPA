@@ -256,6 +256,9 @@ function renderModelCard(s) {
     ['Distance',        s.inference.distance],
     ['Scale fusion',    s.inference.fusion],
     ['Image score',     s.inference.aggregation],
+    ['Memory channel',  s.inference.memory && s.inference.memory !== 'off'
+                          ? `${s.inference.memory} — ${s.inference.memory_images} normal images`
+                          : 'off'],
   ];
 
   el.cardgrid.innerHTML = '';
