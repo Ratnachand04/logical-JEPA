@@ -230,6 +230,8 @@ def api_status():
             "aggregation": scorer.aggregation,
             "deviation": scorer.deviation,
             "cardinality": scorer.cardinality,
+            "memory": scorer.memory,
+            "memory_images": len(scorer.memory_paths),
         },
         "calibration": scorer.calibration.to_dict(),
     })
@@ -345,28 +347,52 @@ def load_state(checkpoint: str, overrides: list[str], calibrate: bool) -> None:
     root = cfg.get_path("data.root", "data/mvtec_loco")
     img_size = cfg.get_path("data.img_size", 256)
 
-    # Prefer the calibration saved by evaluate.py; fall back to fitting one on
-    # validation normals so the demo still gives a meaningful verdict.
+    # Prefer the calibration (and memory bank) saved by evaluate.py; fall back
+    # to fitting them so the demo still gives a meaningful verdict.
     calib_path = os.path.join(os.path.dirname(checkpoint), "calibration.json")
     calibrated = False
+
+    bank_path = os.path.join(os.path.dirname(checkpoint), "memory_bank.pt")
 
     if os.path.isfile(calib_path):
         with open(calib_path, encoding="utf-8") as handle:
             scorer.calibration = Calibration.from_dict(json.load(handle))
         calibrated = True
         logger.info(f"Loaded calibration from {calib_path}")
-    elif calibrate:
+        if scorer.memory != "only" and not scorer.calibration.scale_stats:
+            # Fitted by a memory-only evaluation: it has no JEPA statistics.
+            calibrated = False
+            logger.warning("The saved calibration has no JEPA statistics; refitting")
+        if calibrated and scorer.uses_memory:
+            # A calibration fitted without the memory channel cannot score with it.
+            if os.path.isfile(bank_path) and scorer.calibration.mem_stats:
+                scorer.load_memory_bank(torch.load(bank_path, weights_only=True), device)
+                logger.info(f"Loaded memory bank from {bank_path}")
+            else:
+                calibrated = False
+                logger.warning("anomaly.memory is on but the saved calibration has no "
+                               "memory bank; refitting")
+    if not calibrated and calibrate:
         try:
-            from datasets.mvtec_loco import build_dataloaders
+            from datasets.mvtec_loco import build_dataloaders, build_normal_loader
 
             train_loader, val_loader, _ = build_dataloaders(cfg, category, num_workers=0)
+            # Statistics (and the memory bank) from the training normals --
+            # in a few-shot run, only the K training images -- as evaluate.py does.
             scorer.calibrate(val_loader or train_loader, device,
-                             cfg.get_path("eval.sigma_threshold", 3.0))
+                             cfg.get_path("eval.sigma_threshold", 3.0),
+                             stats_loader=build_normal_loader(cfg, category, "train",
+                                                              num_workers=0))
             calibrated = True
             logger.info(f"Fitted calibration on {scorer.calibration.n_samples} normal images")
         except Exception as exc:  # noqa: BLE001
+            if scorer.uses_memory:
+                raise SystemExit(f"Could not fit the memory bank ({exc}).") from exc
             logger.warning(f"Could not calibrate ({exc}); verdicts will be uncalibrated")
-    else:
+    elif not calibrated:
+        if scorer.uses_memory:
+            raise SystemExit("anomaly.memory is on but no memory bank is available. "
+                             "Run evaluate.py with this config first, or start with --calibrate.")
         logger.warning("No calibration available -- run evaluate.py for meaningful verdicts")
 
     try:
