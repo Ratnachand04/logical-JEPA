@@ -20,11 +20,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .anomaly_map import fuse_scales, upsample_map
 
 AGGREGATIONS = ("topk", "max", "mean", "topk_grid")
 CARDINALITY_MODES = ("off", "add", "only")
+MEMORY_MODES = ("off", "add", "only")
 
 
 def aggregate_score(
@@ -81,6 +83,8 @@ class Calibration:
     scale_stats: dict = field(default_factory=dict)
     # Same format as scale_stats, for the cardinality grids (Phase 3c).
     card_stats: dict = field(default_factory=dict)
+    # Same format again, for the memory-bank grid (key 0).
+    mem_stats: dict = field(default_factory=dict)
 
     def normalize(self, scores: np.ndarray) -> np.ndarray:
         """Express scores as standard deviations above the normal mean."""
@@ -111,12 +115,13 @@ class Calibration:
             # lists; from_dict reverses both.
             "scale_stats": _stats_to_json(self.scale_stats),
             "card_stats": _stats_to_json(self.card_stats),
+            "mem_stats": _stats_to_json(self.mem_stats),
         }
 
     @classmethod
     def from_dict(cls, payload: dict) -> "Calibration":
         fields = {k: payload[k] for k in payload if k in cls.__annotations__}
-        for key in ("scale_stats", "card_stats"):
+        for key in ("scale_stats", "card_stats", "mem_stats"):
             if key in fields:
                 fields[key] = _stats_from_json(fields[key])
         return cls(**fields)
@@ -215,6 +220,11 @@ class AnomalyScorer:
         distance: override the distance used for scoring (scoring ablation).
         chunk: sweep positions evaluated per forward pass; lower it if VRAM is
             tight.
+        memory / memory_weight: the memory-bank channel (Study 11). The JEPA
+            error asks "is this region what the context predicts?"; the memory
+            bank asks "has a patch like this been seen on a normal part?". The
+            bank holds the *teacher's* features of the images the statistics
+            are fitted on -- in a few-shot run, exactly the K training images.
     """
 
     def __init__(
@@ -235,7 +245,14 @@ class AnomalyScorer:
         chunk: int = 16,
         cardinality: str = "off",
         cardinality_weight: float = 1.0,
+        memory: str = "off",
+        memory_weight: float = 1.0,
     ):
+        if memory not in MEMORY_MODES:
+            raise ValueError(f"Unknown memory mode '{memory}'. Available: {MEMORY_MODES}")
+        if memory == "only" and cardinality != "off":
+            raise ValueError("anomaly.memory=only scores the memory bank alone; "
+                             "set anomaly.cardinality=off with it.")
         if cardinality not in CARDINALITY_MODES:
             raise ValueError(
                 f"Unknown cardinality mode '{cardinality}'. Available: {CARDINALITY_MODES}"
@@ -269,11 +286,93 @@ class AnomalyScorer:
         # only -> the cardinality channel alone, to isolate what it contributes
         self.cardinality = cardinality
         self.cardinality_weight = cardinality_weight
+        # off  -> no memory channel (every previously reported number)
+        # add  -> JEPA + memory_weight * memory, fused per patch in z-units
+        # only -> the memory bank alone, to isolate what it contributes
+        self.memory = memory
+        self.memory_weight = memory_weight
+        self.memory_bank: torch.Tensor | None = None     # (M, D), unit-norm
+        self.memory_owner: torch.Tensor | None = None    # (M,) index into memory_paths
+        self.memory_paths: list[str] = []
         self.calibration = Calibration()
 
     @property
     def uses_cardinality(self) -> bool:
         return self.cardinality != "off"
+
+    @property
+    def uses_memory(self) -> bool:
+        return self.memory != "off"
+
+    # ------------------------------------------------------------------ #
+    # Memory bank
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def _teacher_features(self, images: torch.Tensor) -> torch.Tensor:
+        """Unit-norm teacher embedding of every patch. (B, N, D)."""
+        return F.normalize(self.model.encode_targets(images).float(), dim=-1)
+
+    @torch.no_grad()
+    def fit_memory_bank(self, loader, device) -> int:
+        """Store the teacher features of every patch of every normal image.
+
+        Fitted on the same loader as the positional statistics -- in a few-shot
+        run, the K training images and nothing else. Returns the bank size.
+        """
+        self.model.eval()
+        feats, owners, paths = [], [], []
+        for batch in loader:
+            images = batch["image"].to(device, non_blocking=True)
+            f = self._teacher_features(images)
+            for i in range(f.size(0)):
+                owners.append(torch.full((f.size(1),), len(paths), dtype=torch.long))
+                paths.append(str(batch["path"][i]))
+            feats.append(f.reshape(-1, f.size(-1)))
+        if not feats:
+            raise ValueError("fit_memory_bank received no images")
+        # Rounded to fp16 here, the precision it is saved at, so a bank loaded
+        # by the demo scores exactly as the one evaluation used.
+        self.memory_bank = torch.cat(feats).half().float()
+        self.memory_owner = torch.cat(owners).to(self.memory_bank.device)
+        self.memory_paths = paths
+        return int(self.memory_bank.size(0))
+
+    @torch.no_grad()
+    def _memory_grid(self, images: torch.Tensor, paths=None) -> torch.Tensor:
+        """Distance from each patch to its nearest bank patch. (B, H, W).
+
+        An image that is itself in the bank -- only ever the case while fitting
+        the statistics -- is compared with the *other* bank images, otherwise
+        its distance would be exactly zero and the statistics meaningless.
+        """
+        if self.memory_bank is None:
+            raise RuntimeError("anomaly.memory is on but no memory bank was fitted "
+                               "or loaded; run calibrate() or load_memory_bank().")
+        feats = self._teacher_features(images)
+        bank = self.memory_bank.to(feats.device)
+        owner = self.memory_owner.to(feats.device)
+        index = {p: i for i, p in enumerate(self.memory_paths)}
+        grid = self.model.grid_size
+
+        out = []
+        for i in range(feats.size(0)):
+            dist = torch.cdist(feats[i], bank)                      # (N, M)
+            own = index.get(str(paths[i])) if paths is not None else None
+            if own is not None:
+                dist[:, owner == own] = float("inf")
+            out.append(dist.min(dim=1).values.reshape(grid, grid))
+        return torch.stack(out)
+
+    def memory_state(self) -> dict:
+        """What :meth:`load_memory_bank` needs, for saving beside a checkpoint."""
+        return {"features": self.memory_bank.half().cpu(),
+                "owner": self.memory_owner.cpu(),
+                "paths": list(self.memory_paths)}
+
+    def load_memory_bank(self, state: dict, device=None) -> None:
+        self.memory_bank = state["features"].float().to(device or "cpu")
+        self.memory_owner = state["owner"].long().to(device or "cpu")
+        self.memory_paths = list(state["paths"])
 
     def _grids(self, images: torch.Tensor):
         """``(jepa_grids, card_grids_or_None)`` for a batch."""
@@ -286,20 +385,25 @@ class AnomalyScorer:
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def score_batch(self, images: torch.Tensor, return_grids: bool = False) -> dict:
+    def score_batch(self, images: torch.Tensor, return_grids: bool = False,
+                    paths=None) -> dict:
         """Score a batch of images.
 
         Returns a dict with ``scores`` (B,), ``maps`` (B, 1, H, W) and -- when
         ``return_grids`` -- the raw per-scale 16x16 grids, which the
         visualisation script uses to show what each scale contributed.
+        ``paths`` lets an image that is itself in the memory bank be compared
+        with the rest of the bank only.
         """
         self.model.eval()
 
-        grids, card_grids = self._grids(images)
+        # memory=only needs no sweep at all, which is most of the cost.
+        grids, card_grids = ({}, None) if self.memory == "only" else self._grids(images)
+        mem_grid = self._memory_grid(images, paths) if self.uses_memory else None
 
         def _maps(normalize: str) -> torch.Tensor:
             fused = None
-            if self.cardinality != "only":
+            if self.cardinality != "only" and self.memory != "only":
                 fused = fuse_scales(
                     grids, mode=self.fusion, weights=self.weights,
                     normalize=normalize, scale_stats=self.calibration.scale_stats,
@@ -314,6 +418,13 @@ class AnomalyScorer:
                     scale_stats=self.calibration.card_stats, deviation="signed",
                 )
                 fused = card if fused is None else fused + self.cardinality_weight * card
+            if mem_grid is not None:
+                # A nearest-neighbour distance has no "too easy" direction.
+                mem = fuse_scales(
+                    {0: mem_grid}, mode="mean", normalize=normalize,
+                    scale_stats=self.calibration.mem_stats, deviation="signed",
+                )
+                fused = mem if fused is None else fused + self.memory_weight * mem
             return upsample_map(fused, out_size=self.out_size, sigma=self.sigma)
 
         # Study 4 measured that no single normalisation is best at both jobs,
@@ -337,6 +448,8 @@ class AnomalyScorer:
             out["grids"] = grids
             if card_grids is not None:
                 out["card_grids"] = card_grids
+            if mem_grid is not None:
+                out["memory_grid"] = mem_grid
         return out
 
     @torch.no_grad()
@@ -356,7 +469,7 @@ class AnomalyScorer:
 
         for batch in iterator:
             images = batch["image"].to(device, non_blocking=True)
-            out = self.score_batch(images)
+            out = self.score_batch(images, paths=batch.get("path"))
 
             scores.append(out["scores"].float().cpu().numpy())
             labels.append(batch["label"].numpy())
@@ -406,17 +519,24 @@ class AnomalyScorer:
         self.model.eval()
         jepa_acc = _MomentAccumulator()
         card_acc = _MomentAccumulator()
+        mem_acc = _MomentAccumulator()
 
         for batch in loader:
             images = batch["image"].to(device, non_blocking=True)
-            grids, card_grids = self._grids(images)
-            jepa_acc.add(grids)
-            if card_grids is not None:
-                card_acc.add(card_grids)
+            if self.memory != "only":
+                grids, card_grids = self._grids(images)
+                jepa_acc.add(grids)
+                if card_grids is not None:
+                    card_acc.add(card_grids)
+            if self.uses_memory:
+                # Bank images are compared with the OTHER bank images
+                # (leave-one-image-out), so the spread is that of a new image.
+                mem_acc.add({0: self._memory_grid(images, batch.get("path"))})
 
         # Stored on the instance rather than returned, so the return type (and
         # every existing caller) is unchanged when cardinality is off.
         self._fitted_card_stats = card_acc.finish(min_std)
+        self._fitted_mem_stats = mem_acc.finish(min_std)
         return jepa_acc.finish(min_std)
 
     @torch.no_grad()
@@ -442,11 +562,18 @@ class AnomalyScorer:
         Passing a loader containing anomalies would leak label information into
         the threshold and invalidate the unsupervised claim, so the caller must
         hand over ``validation/good`` or ``train/good``.
+
+        With ``memory`` on, the memory bank is built from ``stats_loader`` too:
+        the same normal images the positional statistics come from.
         """
+        if self.uses_memory:
+            self.fit_memory_bank(stats_loader or loader, device)
         scale_stats = self.fit_scale_stats(stats_loader or loader, device)
         card_stats = getattr(self, "_fitted_card_stats", {})
+        mem_stats = getattr(self, "_fitted_mem_stats", {})
         self.calibration.scale_stats = scale_stats
         self.calibration.card_stats = card_stats
+        self.calibration.mem_stats = mem_stats
 
         out = self.score_loader(loader, device, collect_maps=True)
         self.calibration = fit_calibration(
@@ -454,6 +581,7 @@ class AnomalyScorer:
         )
         self.calibration.scale_stats = scale_stats
         self.calibration.card_stats = card_stats
+        self.calibration.mem_stats = mem_stats
         return self.calibration
 
     def predict(self, images: torch.Tensor) -> dict:
@@ -469,6 +597,7 @@ class AnomalyScorer:
             "maps": out["maps"],
             "grids": out["grids"],
             "card_grids": out.get("card_grids"),
+            "memory_grid": out.get("memory_grid"),
         }
 
 
@@ -505,4 +634,7 @@ def build_scorer(cfg, model, mask_bank) -> AnomalyScorer:
         chunk=node.get("sweep_chunk", 16),
         cardinality=_cardinality_mode(node.get("cardinality", "off")),
         cardinality_weight=float(node.get("cardinality_weight", 1.0)),
+        # Same YAML off/on pitfall as cardinality, so the same parser.
+        memory=_cardinality_mode(node.get("memory", "off")),
+        memory_weight=float(node.get("memory_weight", 1.0)),
     )
