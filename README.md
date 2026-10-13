@@ -65,6 +65,8 @@ Two result sets, kept separate because they are not interchangeable:
   sections below. These validated the pipeline and produced the design decisions.
 - **Real MVTec LOCO AD** — see [`outputs/phase1/SUMMARY.md`](outputs/phase1/SUMMARY.md) for
   the multi-seed re-run and whether the synthetic ordering reproduced.
+- **Few-shot with a pretrained encoder** (16 normal images, real LOCO, 3 seeds) — see
+  [its section below](#few-shot-with-a-pretrained-encoder).
 
 > **The synthetic numbers below are single-seed and are labelled as such throughout.** A
 > single-seed AUROC on a small test split carries enough spread to reorder ablation arms by
@@ -249,6 +251,46 @@ py -3.12 run_ablations.py --config configs/ablations.yaml --study all
 
 ---
 
+## Few-shot with a pretrained encoder
+
+`configs/fewshot.yaml` is the same JEPA with three changes: the encoder starts from
+self-supervised **DINO ViT-S/16** weights (kept frozen; only the 1.48M-parameter predictor
+trains), training sees only **16 normal images**, and the score adds a **memory bank** —
+the teacher's features of those same 16 images — to the JEPA prediction error. No other
+normal image is used for training, the per-position statistics or the bank. Full write-up,
+including the diagnostics, in [`outputs/fewshot/SUMMARY.md`](outputs/fewshot/SUMMARY.md).
+
+**Why DINO and not I-JEPA:** Meta released I-JEPA only as ViT-H/14 — 10.4 GB and ~632M
+parameters — which the ~299-pass anomaly sweep cannot run on an 8 GB laptop GPU. DINO is
+the same family (self-supervised, EMA teacher), uses the same 16 px patch, and is 87 MB.
+The transfer is checked against an independent forward pass (cosine 0.9999998).
+
+Real MVTec LOCO, **3 seeds**, same schedule and step count for every arm:
+
+| | `pushpins` image AUROC | `juice_bottle` image AUROC | `juice_bottle` AU-PRO |
+|---|---|---|---|
+| from scratch, **all** normal images (372 / 335) | **0.643 ± 0.006** | 0.668 ± 0.052 | 0.488 |
+| from scratch, 16 images | 0.574 ± 0.050 | — | — |
+| DINO frozen, 16 images, JEPA error | 0.544 ± 0.006 | 0.678 ± 0.010 | 0.633 |
+| **DINO frozen, 16 images, JEPA + memory** (shipped) | 0.559 ± 0.002 | **0.726 ± 0.015** | **0.760** |
+| DINO frozen, 16 images, memory bank alone | 0.585 ± 0.041 | 0.796 ± 0.009 | 0.787 |
+
+- **On `juice_bottle`, 16 images do the job of 335** — and localise far better.
+- **On `pushpins` they do not.** A training-free probe shows the frozen features at 256 px
+  cannot resolve its small defects (nothing on them exceeds 0.65), so keep the
+  from-scratch model there. Run the probe before training on a new category:
+  `py -3.12 scripts/diagnose_fewshot.py layers --category <name>` (one minute).
+- **The memory bank alone scores highest.** The shipped model keeps the JEPA term because
+  this is a JEPA project; `anomaly.memory: only` is the one-line alternative, and it no
+  longer uses the predictor.
+- **The default 3σ threshold is too strict for few-shot models**: they rank anomalies
+  above normals but flag only 2–9% of them at that threshold. Lower
+  `eval.sigma_threshold` to trade false alarms for detections.
+- On synthetic `screw_board` the few-shot model scores 1.000 on every seed: the synthetic
+  set is too easy for pretrained features and cannot rank them.
+
+---
+
 ## Quick start
 
 Requires **Python 3.12** installed globally. This project deliberately uses the global
@@ -270,6 +312,17 @@ py -3.12 evaluate.py --checkpoint checkpoints/logical_jepa_multiscale/screw_boar
 # 5. launch the web demo
 py -3.12 app/server.py --checkpoint checkpoints/logical_jepa_multiscale/screw_board/final.pt
 #    -> http://127.0.0.1:5000
+```
+
+**Few-shot, pretrained** — the same JEPA with its encoder initialised from self-supervised
+DINO ViT-S/16 weights (86.7 MB, downloaded once and checksum-verified), trained on only
+**16 normal images**. See [Few-shot with a pretrained encoder](#few-shot-with-a-pretrained-encoder):
+
+```bash
+py -3.12 scripts/fetch_pretrained.py                     # optional: download ahead of time
+py -3.12 train.py --config configs/fewshot.yaml          # 16 normal images
+py -3.12 train.py --config configs/fewshot.yaml --set data.num_train_images=8
+py -3.12 evaluate.py --checkpoint checkpoints/fewshot_dino/screw_board/final.pt
 ```
 
 To train the best measured configuration instead of the strategy under study:
@@ -303,8 +356,11 @@ masking strategy and the scoring procedure, not scale.
 
 Everything — multi-head attention, the MLP block, stochastic depth, the ViT initialization,
 the 2-D sin-cos position table, the EMA mechanism, the coreset selection in the PatchCore
-baseline — is implemented in this repository. **No ImageNet backbone, no pretrained I-JEPA,
-DINO, CLIP or ViT weights.** Every model starts from random initialization.
+baseline — is implemented in this repository. **The default configuration (`loco.yaml`) uses
+no ImageNet backbone and no pretrained I-JEPA, DINO, CLIP or ViT weights**: every model it
+builds starts from random initialization, and `test_model.py` enforces that. The few-shot
+configuration (`fewshot.yaml`) is the one deliberate exception — see
+[Few-shot with a pretrained encoder](#few-shot-with-a-pretrained-encoder).
 
 Two design choices are load-bearing and worth calling out:
 
@@ -469,15 +525,18 @@ project targets.
 ## Tests
 
 ```bash
-py -3.12 -m pytest tests/ -q          # 285 tests, ~35 s
+py -3.12 -m pytest tests/ -q          # 346 tests, ~35 s
 ```
 
 | file | tests | what it guards |
 |---|---:|---|
 | `test_masking.py` | 42 | context/target disjointness, sweep coverage, scale semantics |
 | `test_scoring.py` | 34 | normalization trade-off, **calibration sees no anomaly** |
-| `test_model.py` | 33 | **no pretrained weights**, teacher detachment, EMA arithmetic |
-| `test_aggregate.py` | 27 | multi-seed stats, refusing to rank inside the noise |
+| `test_model.py` | 33 | **no pretrained weights by default**, teacher detachment, EMA arithmetic |
+| `test_pretrained.py` | 26 | **exact parity with real DINO**, no partial loads, offline checkpoint rebuild |
+| `test_fewshot.py` | 20 | **calibration uses only the few images**, budget survives evaluation, test never thinned |
+| `test_memory.py` | 14 | **bank holds only the K images**, no self-match, saved bank reproduces scores |
+| `test_aggregate.py` | 28 | multi-seed stats, refusing to rank inside the noise |
 | `test_vicreg.py` | 26 | both collapse modes, the vanishing-gradient limit |
 | `test_dataset.py` | 23 | **train/validation stay anomaly-free**, transform policy |
 | `test_metrics.py` | 17 | AUROC endpoints, AU-PRO region weighting |
@@ -486,6 +545,7 @@ py -3.12 -m pytest tests/ -q          # 285 tests, ~35 s
 | `test_decoupled_norm.py` | 13 | detection and localization paths stay separate |
 | `test_cardinality.py` | 18 | **stop-gradient into the slots**, `off` changes nothing, subtype breakdown |
 | `test_hierarchical.py` | 13 | **slot term never trains the slot module**, permutation invariance |
+| `test_deviation.py` | 9 | signed vs absolute deviation |
 
 The bolded rows encode project *constraints* rather than ordinary correctness. They exist so
 a future change cannot quietly invalidate a research claim — a leaked anomaly in the
@@ -497,8 +557,9 @@ make every reported number optimistic.
 ```
 logical-JEPA/
 ├── configs/
-│   ├── loco.yaml              # default configuration
-│   └── ablations.yaml         # the four ablation studies
+│   ├── loco.yaml              # default configuration (from scratch)
+│   ├── fewshot.yaml           # few-shot: DINO encoder, 16 images, JEPA + memory bank
+│   └── ablations.yaml         # the ablation studies (1-11)
 ├── models/
 │   ├── patch_embed.py         # patchify + fixed 2-D sin-cos positions
 │   ├── transformer.py         # MHSA, MLP, DropPath, ViT init — from scratch
@@ -507,6 +568,7 @@ logical-JEPA/
 │   ├── predictor.py           # narrow transformer, imagines hidden regions
 │   ├── slot_bottleneck.py     # slot attention + permutation-invariant set helpers
 │   ├── cardinality.py         # region foreground-mass head (Phase 3c)
+│   ├── pretrained.py          # DINO registry, verified download, weight transfer
 │   └── logical_jepa.py        # training step + masked inference sweep
 ├── masking/
 │   ├── base.py                # MaskSpec, block sampling, context complement
@@ -531,7 +593,7 @@ logical-JEPA/
 │   ├── server.py              # Flask inference API
 │   └── static/                # HTML + CSS + JS frontend
 ├── utils/                     # config, logging, seeding
-├── scripts/download_data.py
+├── scripts/                   # download_data, fetch_pretrained, benchmark_latency, ...
 ├── train.py  evaluate.py  visualize.py  run_ablations.py
 └── requirements.txt
 ```
@@ -579,7 +641,11 @@ py -3.12 visualize.py --checkpoint <path> --mode latent --defect logical_anomali
 py -3.12 run_ablations.py --study all                          # everything
 py -3.12 run_ablations.py --study masking                      # trains 5 models
 py -3.12 run_ablations.py --study scoring --checkpoint <path>  # inference only
+py -3.12 run_ablations.py --study fewshot --seeds 0,1,2 --set experiment.name=fewshot
 ```
+
+`--arms a,b` restricts a training study to some of its arms, so a long study can be split
+into chunks; each arm's results are saved on their own.
 
 | Study | Question | Cost |
 |---|---|---|
@@ -587,6 +653,8 @@ py -3.12 run_ablations.py --study scoring --checkpoint <path>  # inference only
 | 2 · scoring | cosine vs L2 vs combined (Methods A/B/C) | inference only |
 | 3 · sweep | Does the *inference* window scale matter independently? | inference only |
 | 4 · normalization | Per-position vs per-image normalization | inference only |
+| 10 · fewshot | Does a DINO-initialised JEPA on 4–32 images match from-scratch on all? | 8 training runs |
+| 11 · memory | Does a memory bank on the teacher's features help the few-shot JEPA? | inference only |
 
 Results land in `outputs/<experiment>/<category>/` as per-study CSVs plus a JSON summary.
 The whole suite takes about 40 minutes on an RTX 4060.
@@ -624,7 +692,8 @@ already in the bank.
 > research question — both methods then see identical features and differ only in how they
 > use them, memory lookup versus contextual prediction — but it means the absolute numbers
 > are **not comparable to published PatchCore results**, and PatchCore's weak showing here
-> should not be read as a criticism of the published method.
+> should not be read as a criticism of the published method. (The few-shot model *does* use
+> pretrained features; PatchCore has not been re-run on them.)
 
 ---
 
