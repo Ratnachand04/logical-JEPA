@@ -257,3 +257,8 @@ def test_study_10_is_defined_and_its_default_arm_is_the_shipped_config():
     for key in ("train.epochs", "train.warmup_epochs", "train.lr", "train.batch_size",
                 "masking.strategy", "predictor.predictor_dim", "predictor.depth"):
         assert shipped.get_path(key) == study.get_path(key), key
+
+    # ... and scores it the way Study 11's mem_add arm measured.
+    scoring = {a["name"]: a["overrides"] for a in study.get_path("ablation.memory")}
+    for key, value in scoring["mem_add"].items():
+        assert shipped.get_path(key) == value, key
