@@ -182,19 +182,37 @@ def cmd_stats(args, device):
     grids_train = _sweep(scorer, train, device)
     grids_test = _sweep(scorer, test, device)
     split, sc = TestSplit(test), _Scorer(scorer, device)
-    rng = np.random.default_rng(0)
-    probe = sorted(rng.choice(unseen_idx, min(64, len(unseen_idx)), replace=False).tolist())
 
     print(f"{cat}: {k}-shot checkpoint (subset_seed {seed}), {len(test)} test images")
-    variants = [(f"stats on the {k} images it trained on", seen_idx),
-                (f"stats on {k} images it never saw", probe[:k]),
-                (f"stats on {len(unseen_idx)} images it never saw", unseen_idx)]
-    for name, idx in variants:
+    for name, idx, held_out in stats_variants(k, seen_idx, unseen_idx):
         stats = _fit_stats({w: t[idx] for w, t in grids_train.items()})
-        held_out = [i for i in probe if i not in set(idx)] or probe
-        normal = sc.image_scores(sc.fused({w: t[held_out] for w, t in grids_train.items()}, stats))
         test_scores = sc.image_scores(sc.fused(grids_test, stats))
-        print(split.line(name, test_scores), f" held-out normal score {normal.mean():6.2f}")
+        if held_out:
+            normal = sc.image_scores(sc.fused({w: t[held_out] for w, t in grids_train.items()},
+                                              stats))
+            held = f"{normal.mean():6.2f}"
+        else:
+            held = "     -"                     # every unseen image was used for the stats
+        print(split.line(name, test_scores), f" held-out normal score {held}")
+
+
+def stats_variants(k: int, seen_idx: list[int], unseen_idx: list[int]):
+    """``(name, stats_indices, held_out_indices)`` for each statistics variant.
+
+    Unseen subsets are drawn from one seeded generator, K images then 64; the
+    held-out normals are the first 64 unseen images NOT used for the
+    statistics. This is the exact procedure behind the table in
+    outputs/fewshot/SUMMARY.md.
+    """
+    rng = np.random.default_rng(0)
+    variants = [(f"stats on the {k} images it trained on", list(seen_idx))]
+    for m in (k, 64):
+        m = min(m, len(unseen_idx))
+        picked = sorted(rng.choice(unseen_idx, m, replace=False).tolist())
+        variants.append((f"stats on {m} images it never saw", picked))
+    variants.append((f"stats on all {len(unseen_idx)} images it never saw", list(unseen_idx)))
+    return [(name, idx, [i for i in unseen_idx if i not in set(idx)][:64])
+            for name, idx in variants]
 
 
 # --------------------------------------------------------------------------- #
