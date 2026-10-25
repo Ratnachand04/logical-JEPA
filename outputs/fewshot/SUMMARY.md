@@ -107,6 +107,7 @@ never saw removes the inflation, **and barely moves the AUROC**:
 |---|---:|---:|---:|---:|
 | the 16 training images (as evaluated) | 0.543 | 0.524 | 0.563 | 28.45 |
 | 16 images it never saw | 0.589 | 0.556 | 0.627 | 4.88 |
+| 64 images it never saw | 0.532 | 0.484 | 0.586 | 2.49 |
 | all 356 images it never saw | 0.548 | 0.504 | 0.597 | — |
 
 (DINO 16-shot, seed 0.)
@@ -114,15 +115,17 @@ never saw removes the inflation, **and barely moves the AUROC**:
 ### 2. The backbone is the limit on this category
 
 A training-free probe: patch features of the same 16 images, from every DINO
-layer, as a nearest-neighbour memory bank (best layer shown):
+layer, as a nearest-neighbour memory bank; each test image scored by its
+patch farthest from the bank. The layer with the best image AUROC is shown
+(`scripts/diagnose_fewshot.py layers`):
 
-| category | image | logical | structural |
-|---|---:|---:|---:|
-| juice_bottle | 0.859 | 0.873 | 0.839 |
-| breakfast_box | 0.794 | 0.824 | 0.767 |
-| splicing_connectors | 0.725 | 0.676 | 0.796 |
-| screw_bag | 0.661 | 0.533 | 0.875 |
-| **pushpins** | **0.650** | 0.617 | 0.687 |
+| category | best layer | image | logical | structural |
+|---|---:|---:|---:|---:|
+| juice_bottle | 3 | 0.821 | 0.816 | 0.830 |
+| breakfast_box | 6 | 0.764 | 0.781 | 0.748 |
+| splicing_connectors | 9 | 0.725 | 0.676 | 0.786 |
+| screw_bag | 6 | 0.661 | 0.533 | 0.875 |
+| **pushpins** | 6 | **0.650** | 0.617 | 0.687 |
 
 Even without the JEPA, nothing built on these features exceeds 0.65 on
 `pushpins`: a bent pin tip is small against a 16 px patch of a 256 px image.
