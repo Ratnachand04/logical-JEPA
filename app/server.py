@@ -192,6 +192,10 @@ def api_status():
     scorer = STATE["scorer"]
 
     if model is None:
+        # Compare-only mode: no category model, but the reference model may be up.
+        if REFERENCE["scorer"] is not None:
+            return jsonify({"ready": False, "error": "No category model loaded",
+                            "reference": reference_info()})
         return jsonify({"ready": False, "error": "No model loaded"}), 503
 
     encoder = model.context_encoder.num_parameters()
@@ -234,6 +238,7 @@ def api_status():
             "memory_images": len(scorer.memory_paths),
         },
         "calibration": scorer.calibration.to_dict(),
+        "reference": reference_info(),
     })
 
 
@@ -412,9 +417,141 @@ def load_state(checkpoint: str, overrides: list[str], calibrate: bool) -> None:
     logger.info(f"Checkpoint epoch {payload.get('epoch', '?')}, category '{category}'")
 
 
+# --------------------------------------------------------------------------- #
+# Reference comparison (any product: a correct part vs the part to check)
+# --------------------------------------------------------------------------- #
+REFERENCE: dict = {"scorer": None, "payload": None, "checkpoint": None, "cache": {}}
+REFERENCE_CACHE_SIZE = 4
+
+
+def reference_info() -> dict:
+    scorer = REFERENCE["scorer"]
+    if scorer is None:
+        return {"available": False}
+    payload = REFERENCE["payload"]
+    threshold = scorer.calibration.get("threshold", float("inf"))
+    return {
+        "available": True,
+        "checkpoint": REFERENCE["checkpoint"],
+        "backbone": scorer.model.backbone,
+        "products_trained": len(payload.get("products", [])),
+        "holdout": payload.get("holdout", []),
+        "predictor_params": scorer.model.predictor.num_parameters(),
+        "windows": list(scorer.bank.scales()),
+        "calibrated": bool(np.isfinite(threshold)),
+        "threshold": float(threshold) if np.isfinite(threshold) else None,
+    }
+
+
+def _prepared_references(files) -> object:
+    """Encode references once per distinct set of uploads (small LRU cache)."""
+    import hashlib
+
+    blobs = [f.read() for f in files]
+    key = hashlib.sha1(b"".join(hashlib.sha1(b).digest() for b in blobs)).hexdigest()
+    cache = REFERENCE["cache"]
+    if key in cache:
+        cache[key] = cache.pop(key)          # mark as most recently used
+        return cache[key]
+    images = [Image.open(io.BytesIO(b)) for b in blobs]
+    state = REFERENCE["scorer"].prepare(images)
+    cache[key] = state
+    while len(cache) > REFERENCE_CACHE_SIZE:
+        cache.pop(next(iter(cache)))
+    return state
+
+
+@app.route("/api/compare", methods=["POST"])
+def api_compare():
+    """Compare an uploaded current image with one or more reference images."""
+    scorer = REFERENCE["scorer"]
+    if scorer is None:
+        return jsonify({"error": "No reference model loaded (start the server with "
+                                 "--reference-checkpoint)"}), 503
+    refs = [f for f in request.files.getlist("reference") if f and f.filename]
+    current = request.files.get("current")
+    if not refs or current is None or not current.filename:
+        return jsonify({"error": "Upload at least one reference image and one current image"}), 400
+    if len(refs) > 4:
+        refs = refs[:4]
+    try:
+        started = time.perf_counter()
+        try:
+            sensitivity = float(request.form.get("sensitivity", 1.0))
+        except ValueError:
+            sensitivity = 1.0
+        sensitivity = min(max(sensitivity, 0.25), 4.0)
+        state = _prepared_references(refs)
+        out = scorer.compare(Image.open(current), state, sensitivity=sensitivity)
+        heat = out["map"]
+        threshold = out["threshold"]
+        calibrated = bool(np.isfinite(threshold))
+        # Colour scale: saturate where the map reaches this product's decision
+        # level, so the hottest colour means "would be flagged on its own".
+        level = scorer.normal_level(state)
+        hi = threshold * level if (calibrated and out["rule"] == "ratio") else (
+            threshold if calibrated else float(heat.max()))
+        lo = min(float(heat.min()), 0.0)
+        heat_rgb = colorize(heat, lo, max(hi, lo + 1e-6))
+        overlay = blend(out["aligned"], heat_rgb, 0.5)
+        peak = np.unravel_index(int(np.argmax(heat)), heat.shape)
+        anomalous = bool(out["is_anomalous"])
+        return jsonify({
+            "verdict": ("DIFFERENT" if anomalous else "MATCHES") if calibrated else "SCORED",
+            "is_anomalous": anomalous,
+            "calibrated": calibrated,
+            "score": float(out["score"]),
+            "relative_score": float(out["relative_score"]),
+            "decision_value": float(out["decision_value"]),
+            "rule": out["rule"],
+            "sensitivity": sensitivity,
+            "threshold": float(threshold) if calibrated else None,
+            "alignment": out["alignment"],
+            "n_references": len(state.images),
+            "peak": {"y": int(peak[0]), "x": int(peak[1])},
+            "images": {
+                "reference": encode_png(state.images[0]),
+                "current": encode_png(out["aligned"]),
+                "heatmap": encode_png(heat_rgb),
+                "overlay": encode_png(overlay),
+            },
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+        })
+    except Exception as exc:  # noqa: BLE001 - surface the message to the UI
+        logger.exception("comparison failed")
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+
+def load_reference_state(checkpoint: str) -> None:
+    """Load the reference-conditioned model and its calibration."""
+    from anomaly.reference_scoring import ReferenceScorer, load_calibration
+    from train_reference import load_reference_model
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, cfg, payload = load_reference_model(checkpoint, device)
+    node = cfg.get("scoring", {})
+    calibration = load_calibration(checkpoint)
+    REFERENCE.update(
+        scorer=ReferenceScorer(model, device, windows=tuple(node.get("windows", [4])),
+                               sigma=node.get("smooth_sigma", 4.0),
+                               top_k_ratio=node.get("top_k_ratio", 0.01),
+                               n_pseudo=node.get("n_pseudo", 8), align=node.get("align", True),
+                               calibration=calibration),
+        payload=payload, checkpoint=checkpoint, cache={})
+    logger.info(model.describe())
+    if not np.isfinite(calibration["threshold"]):
+        logger.warning("No reference_calibration.json -- comparisons are scored but get no "
+                       "verdict. Run scripts/eval_reference.py --calibrate.")
+    logger.info(f"Reference model trained on {len(payload.get('products', []))} products; "
+                f"held out: {payload.get('holdout') or 'none'}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Logical-JEPA web demo server")
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default=None,
+                        help="category model (single-image inspection)")
+    parser.add_argument("--reference-checkpoint", default=None,
+                        help="reference-conditioned model (compare a part with a reference)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--debug", action="store_true")
@@ -426,7 +563,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    load_state(args.checkpoint, args.set, calibrate=not args.no_calibrate)
+    if not args.checkpoint and not args.reference_checkpoint:
+        raise SystemExit("Give --checkpoint, --reference-checkpoint, or both.")
+    if args.checkpoint:
+        load_state(args.checkpoint, args.set, calibrate=not args.no_calibrate)
+    if args.reference_checkpoint:
+        load_reference_state(args.reference_checkpoint)
 
     logger.info(f"Serving Logical-JEPA at http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
