@@ -193,6 +193,15 @@ async function loadStatus() {
     const res = await fetch('/api/status');
     const data = await res.json();
 
+    if (data.reference && data.reference.available) showCompare(data.reference);
+    if (!data.ready && data.reference && data.reference.available) {
+      // Compare-only server: no category model, so hide single-image inspection.
+      $('inspect').hidden = true;
+      $('modelcard').hidden = true;
+      el.statusChip.textContent = 'compare mode';
+      el.statusChip.className = 'chip chip-ok';
+      return;
+    }
     if (!res.ok || !data.ready) throw new Error(data.error || 'Model not ready');
     state.status = data;
 
@@ -659,6 +668,147 @@ function renderScales(scales, cardinality) {
       cardinality, 'is-cardinality', `cardinality · ${cardinality.mode}`,
       'Cardinality mismatch: expected vs observed component mass'));
   }
+}
+
+/* ----------------------------------------------------------------- compare */
+
+const cmp = { refs: [], cur: null };
+const cmpEl = {
+  section: $('compare'),
+  refDrop: $('ref-drop'), refInput: $('ref-input'), refThumbs: $('ref-thumbs'),
+  curDrop: $('cur-drop'), curInput: $('cur-input'), curThumbs: $('cur-thumbs'),
+  btn: $('compare-btn'), clear: $('compare-clear'), result: $('compare-result'),
+  word: $('cmp-word'), sub: $('cmp-sub'), stats: $('cmp-stats'),
+  sens: $('cmp-sensitivity'), sensValue: $('cmp-sensitivity-value'),
+  imgRef: $('cmp-ref'), imgCur: $('cmp-cur'), imgOverlay: $('cmp-overlay'),
+};
+
+function showCompare(info) {
+  cmpEl.section.hidden = false;
+  const note = info.calibrated
+    ? `threshold ${info.threshold.toFixed(3)}`
+    : 'uncalibrated: scores only';
+  cmpEl.section.querySelector('.panel-sub').title =
+    `${info.backbone} frozen, trained on ${info.products_trained} products; ${note}`;
+}
+
+function setThumbs(container, files) {
+  container.innerHTML = '';
+  for (const f of files) {
+    const img = document.createElement('img');
+    img.alt = f.name;
+    img.src = URL.createObjectURL(f);
+    img.onload = () => URL.revokeObjectURL(img.src);
+    container.appendChild(img);
+  }
+}
+
+function updateCompareButtons() {
+  cmpEl.btn.disabled = !(cmp.refs.length && cmp.cur);
+  cmpEl.clear.disabled = !(cmp.refs.length || cmp.cur);
+}
+
+function wireDrop(zone, input, onFiles) {
+  zone.addEventListener('click', () => input.click());
+  zone.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); }
+  });
+  input.addEventListener('change', (e) => onFiles([...e.target.files]));
+  for (const type of ['dragenter', 'dragover']) {
+    zone.addEventListener(type, (e) => { e.preventDefault(); zone.classList.add('is-drag'); });
+  }
+  for (const type of ['dragleave', 'drop']) {
+    zone.addEventListener(type, (e) => { e.preventDefault(); zone.classList.remove('is-drag'); });
+  }
+  zone.addEventListener('drop', (e) => onFiles([...e.dataTransfer.files]));
+}
+
+const onlyImages = (files) => files.filter((f) => f.type.startsWith('image/'));
+
+wireDrop(cmpEl.refDrop, cmpEl.refInput, (files) => {
+  cmp.refs = onlyImages(files).slice(0, 4);
+  setThumbs(cmpEl.refThumbs, cmp.refs);
+  cmpEl.refDrop.classList.toggle('has-file', cmp.refs.length > 0);
+  updateCompareButtons();
+});
+wireDrop(cmpEl.curDrop, cmpEl.curInput, (files) => {
+  cmp.cur = onlyImages(files)[0] || null;
+  setThumbs(cmpEl.curThumbs, cmp.cur ? [cmp.cur] : []);
+  cmpEl.curDrop.classList.toggle('has-file', !!cmp.cur);
+  updateCompareButtons();
+});
+
+cmpEl.clear.addEventListener('click', () => {
+  cmp.refs = []; cmp.cur = null;
+  setThumbs(cmpEl.refThumbs, []); setThumbs(cmpEl.curThumbs, []);
+  cmpEl.refDrop.classList.remove('has-file'); cmpEl.curDrop.classList.remove('has-file');
+  cmpEl.refInput.value = ''; cmpEl.curInput.value = '';
+  cmpEl.result.hidden = true;
+  updateCompareButtons();
+});
+
+cmpEl.sens.addEventListener('input', () => {
+  cmpEl.sensValue.textContent = `${Number(cmpEl.sens.value).toFixed(2)}×`;
+});
+// The references are cached server-side, so re-running at a new sensitivity is quick.
+cmpEl.sens.addEventListener('change', () => {
+  if (!cmpEl.result.hidden && cmp.refs.length && cmp.cur) runCompare();
+});
+
+cmpEl.btn.addEventListener('click', runCompare);
+
+async function runCompare() {
+  const form = new FormData();
+  for (const f of cmp.refs) form.append('reference', f);
+  form.append('current', cmp.cur);
+  form.append('sensitivity', cmpEl.sens.value);
+  clearAlert();
+  cmpEl.btn.disabled = true;
+  cmpEl.btn.querySelector('.btn-label').textContent = 'Comparing…';
+  try {
+    const res = await fetch('/api/compare', { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+    renderCompare(data);
+  } catch (err) {
+    showAlert(`Comparison failed: ${err.message}`);
+  } finally {
+    cmpEl.btn.querySelector('.btn-label').textContent = 'Compare';
+    updateCompareButtons();
+  }
+}
+
+function renderCompare(r) {
+  cmpEl.result.hidden = false;
+  cmpEl.word.textContent = r.verdict;
+  cmpEl.word.className = `verdict-word ${r.is_anomalous ? 'is-anom' : 'is-normal'}`;
+  cmpEl.sub.textContent = r.calibrated
+    ? `${r.relative_score.toFixed(2)}× this product's normal difference; flagged above ${r.threshold.toFixed(2)}×`
+    : `difference score ${r.score.toFixed(3)} (no threshold calibrated)`;
+  cmpEl.imgRef.src = r.images.reference;
+  cmpEl.imgCur.src = r.images.current;
+  cmpEl.imgOverlay.src = r.images.overlay;
+
+  const a = r.alignment || {};
+  const rows = [
+    ['Relative difference', `${r.relative_score.toFixed(2)}×`],
+    ['Threshold', r.calibrated ? `${r.threshold.toFixed(2)}× (sensitivity ${r.sensitivity.toFixed(2)})` : 'not calibrated'],
+    ['Raw score', r.score.toFixed(3)],
+    ['Alignment', a.aligned ? `aligned (correlation ${Number(a.cc).toFixed(2)})` : 'not aligned'],
+    ['References', String(r.n_references)],
+    ['Strongest difference', `${r.peak.x}, ${r.peak.y} px`],
+    ['Time', `${r.elapsed_ms} ms`],
+  ];
+  cmpEl.stats.innerHTML = '';
+  for (const [k, v] of rows) {
+    const wrap = document.createElement('div');
+    const dt = document.createElement('dt');
+    const dd = document.createElement('dd');
+    dt.textContent = k; dd.textContent = v;
+    wrap.append(dt, dd);
+    cmpEl.stats.appendChild(wrap);
+  }
+  cmpEl.result.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 /* -------------------------------------------------------------------- init */
