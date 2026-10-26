@@ -1,0 +1,79 @@
+# ===========================================================================
+# Logical-JEPA -- REFERENCE-CONDITIONED model (compare any current image with
+# reference images of a correct part)
+#
+#   py -3.12 train_reference.py --config configs/reference.yaml
+#   py -3.12 scripts/eval_reference.py --checkpoint checkpoints/reference/final.pt --calibrate
+#   py -3.12 app/server.py --reference-checkpoint checkpoints/reference/final.pt
+#
+# One model for every product. The encoder is frozen DINO ViT-S/16; the
+# predictor learns to predict hidden regions of the current image from its own
+# visible context plus every token of the reference image(s). It is trained on
+# pairs of different normal images of the same product, drawn from all the
+# products below, so it never needs training on the product a user inspects.
+# ===========================================================================
+
+experiment:
+  name: reference
+  seed: 0
+  output_dir: outputs
+  checkpoint_dir: checkpoints
+
+data:
+  img_size: 256
+  # Products to learn from. `categories: all` takes every folder with train/good.
+  sources:
+    - {root: data/mvtec_loco_256, categories: all}   # 5 MVTec LOCO AD products
+    - {root: data/visa_256, categories: all}         # 12 VisA products
+    - {root: data/mvtec_loco, categories: [screw_board]}  # synthetic board
+  # Products kept out of training entirely (generalisation experiment). Empty
+  # for the deployed model, which learns from everything.
+  holdout: []
+  num_references: 1
+  same_image_prob: 0.2      # share of pairs whose reference is the current image itself
+  augment:                  # independent jitter on each image of a pair
+    translate: 0.04
+    degrees: 3.0
+    scale: [0.95, 1.05]
+    color_jitter: 0.2
+  num_workers: 0            # each worker is a full process; RAM is tight here
+
+model:
+  backbone: dino_vits16     # frozen
+  loss: cosine
+  predictor:
+    predictor_dim: 256
+    depth: 4
+    num_heads: 8
+    mlp_ratio: 4.0
+
+masking:
+  strategy: multiscale
+  mode: mixed
+  num_small_targets: 3
+  num_large_targets: 1
+  small_sizes: [[2, 2], [2, 3], [3, 2], [3, 3]]
+  large_sizes: [[5, 5], [6, 6], [5, 7], [7, 5], [8, 8]]
+
+train:
+  epochs: 30
+  samples_per_epoch: 4096   # pairs per epoch, drawn at random
+  batch_size: 16
+  warmup_epochs: 2
+  lr: 0.0005
+  min_lr: 0.000001
+  weight_decay: 0.04
+  final_weight_decay: 0.4
+  grad_clip: 3.0
+  amp: true
+  log_interval: 5
+
+scoring:
+  # One 4x4 sweep scale (49 masked passes): Study 3 found the scale mix makes
+  # no measurable difference, and it keeps a comparison under a second.
+  windows: [4]
+  n_pseudo: 8               # perturbed copies of the reference for the normal baseline
+  align: true
+  smooth_sigma: 4.0
+  top_k_ratio: 0.01
+  jepa_weight: 1.0          # fusion weight of the JEPA channel (memory channel: 1)
