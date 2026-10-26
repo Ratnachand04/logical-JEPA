@@ -291,6 +291,47 @@ Real MVTec LOCO, **3 seeds**, same schedule and step count for every arm:
 
 ---
 
+## Compare any product with a reference
+
+The models above learn one product at a time. **`configs/reference.yaml` is one model for every
+product**: give it a photo of a correct part (the *reference*) and a photo of the part to check
+(the *current* image), and it shows where and how much they differ. Nothing is trained on the
+product being inspected. Full write-up: [`outputs/reference/SUMMARY.md`](outputs/reference/SUMMARY.md).
+
+**How it works.** The predictor of a frozen-DINO JEPA also attends to every token of the
+reference image(s), and is trained to predict hidden regions of one good part from its own
+context plus a *different* good part of the same product, across 18 products (MVTec LOCO AD,
+VisA and the synthetic board). At test time the current photo is aligned to the reference,
+its prediction error and its distance to the nearest reference patch are compared with a
+baseline measured on perturbed copies of the reference, and the result is expressed relative
+to the reference's own normal level. 3.46M trained parameters, trained once in 53 minutes.
+
+**Products it never saw** (a second model with five products held out; image AUROC, 3 seeds):
+
+| Unseen product | 1 reference | 3 references |
+|---|---:|---:|
+| cashew | 0.908 | **0.915** |
+| candle | 0.814 | 0.789 |
+| juice bottle | 0.701 | **0.762** (logical 0.796) |
+| capsules | 0.565 | 0.573 |
+| pushpins | 0.491 | 0.547 |
+
+- It works when a few photos describe "normal" well, and fails when good parts vary in layout
+  (loose capsules, pushpins) -- a different arrangement looks like a difference.
+- On products of a kind it trained on, the mean is 0.789, and the reference-conditioned JEPA
+  error adds 0.056 over a memory comparison alone; on unseen products the memory channel is
+  still the stronger signal.
+- **Verdicts need several references.** Products differ about fourfold in how much two good
+  parts differ, so one photo cannot calibrate a yes/no answer for a new product. With three
+  references the verdicts are usable but uneven (detection 22–60% at 3–29% false alarms);
+  the UI shows the heatmap and relative score first and has a sensitivity control.
+
+```bash
+py -3.12 app/server.py --checkpoint checkpoints/fewshot_dino/juice_bottle/final.pt     --reference-checkpoint checkpoints/reference/final.pt     # then use "Compare" in the page
+```
+
+---
+
 ## Quick start
 
 Requires **Python 3.12** installed globally. This project deliberately uses the global
@@ -525,7 +566,7 @@ project targets.
 ## Tests
 
 ```bash
-py -3.12 -m pytest tests/ -q          # 346 tests, ~35 s
+py -3.12 -m pytest tests/ -q          # 367 tests, ~35 s
 ```
 
 | file | tests | what it guards |
@@ -536,6 +577,7 @@ py -3.12 -m pytest tests/ -q          # 346 tests, ~35 s
 | `test_pretrained.py` | 26 | **exact parity with real DINO**, no partial loads, offline checkpoint rebuild |
 | `test_fewshot.py` | 20 | **calibration uses only the few images**, budget survives evaluation, test never thinned |
 | `test_memory.py` | 14 | **bank holds only the K images**, no self-match, saved bank reproduces scores |
+| `test_reference.py` | 21 | **the prediction uses the reference**, held-out products stay unseen, safe alignment |
 | `test_aggregate.py` | 28 | multi-seed stats, refusing to rank inside the noise |
 | `test_vicreg.py` | 26 | both collapse modes, the vanishing-gradient limit |
 | `test_dataset.py` | 23 | **train/validation stay anomaly-free**, transform policy |
@@ -559,6 +601,7 @@ logical-JEPA/
 ├── configs/
 │   ├── loco.yaml              # default configuration (from scratch)
 │   ├── fewshot.yaml           # few-shot: DINO encoder, 16 images, JEPA + memory bank
+│   ├── reference.yaml         # one model for any product: compare with a reference
 │   └── ablations.yaml         # the ablation studies (1-11)
 ├── models/
 │   ├── patch_embed.py         # patchify + fixed 2-D sin-cos positions
@@ -569,6 +612,7 @@ logical-JEPA/
 │   ├── slot_bottleneck.py     # slot attention + permutation-invariant set helpers
 │   ├── cardinality.py         # region foreground-mass head (Phase 3c)
 │   ├── pretrained.py          # DINO registry, verified download, weight transfer
+│   ├── reference_jepa.py      # predictor that also attends to reference images
 │   └── logical_jepa.py        # training step + masked inference sweep
 ├── masking/
 │   ├── base.py                # MaskSpec, block sampling, context complement
@@ -593,7 +637,7 @@ logical-JEPA/
 │   ├── server.py              # Flask inference API
 │   └── static/                # HTML + CSS + JS frontend
 ├── utils/                     # config, logging, seeding
-├── scripts/                   # download_data, fetch_pretrained, benchmark_latency, ...
+├── scripts/                   # download_data, fetch_pretrained, prepare_visa, eval_reference, ...
 ├── train.py  evaluate.py  visualize.py  run_ablations.py
 └── requirements.txt
 ```
@@ -663,7 +707,11 @@ The whole suite takes about 40 minutes on an RTX 4060.
 
 ```bash
 py -3.12 app/server.py --checkpoint <path> --port 5000
+py -3.12 app/server.py --reference-checkpoint checkpoints/reference/final.pt   # compare mode only
 ```
+
+With `--reference-checkpoint` the page adds **Compare with a reference**: drop one to four
+photos of a correct part and a photo of the part to check.
 
 Drag in an image (or paste from the clipboard, or click a test sample) and the page shows
 the verdict, the anomaly score against its calibrated threshold, the localization heatmap,
