@@ -79,8 +79,57 @@
     </div>
   </section>
 
+  <!-- ===================== COMPARE ===================== -->
+  <section class="panel compare" id="compare" hidden>
+    <h2 class="panel-title">Compare with a reference</h2>
+    <p class="panel-sub">Give a photo of a correct part and a photo of the part to check. One model
+      covers every product, so nothing is trained on yours; the current photo is aligned to the
+      reference before the two are compared.</p>
+
+    <div class="grid-2 compare-inputs">
+      <div class="dropzone" id="ref-drop" tabindex="0" role="button"
+           aria-label="Upload one or more reference images of a correct part">
+        <input type="file" id="ref-input" accept="image/*" multiple hidden>
+        <p class="dz-main">Reference: <strong>correct part</strong></p>
+        <p class="dz-sub">One photo, or up to four for a sturdier comparison</p>
+        <div class="dz-thumbs" id="ref-thumbs"></div>
+      </div>
+      <div class="dropzone" id="cur-drop" tabindex="0" role="button"
+           aria-label="Upload the image of the part to check">
+        <input type="file" id="cur-input" accept="image/*" hidden>
+        <p class="dz-main">Current: <strong>part to check</strong></p>
+        <p class="dz-sub">Same view as the reference, roughly</p>
+        <div class="dz-thumbs" id="cur-thumbs"></div>
+      </div>
+    </div>
+
+    <div class="run-row">
+      <button class="btn btn-primary" id="compare-btn" disabled>
+        <span class="btn-label">Compare</span>
+      </button>
+      <button class="btn btn-ghost" id="compare-clear" disabled>Clear</button>
+      <label class="sensitivity" for="cmp-sensitivity">Sensitivity
+        <input type="range" id="cmp-sensitivity" min="0.5" max="2" step="0.05" value="1">
+        <span id="cmp-sensitivity-value">1.00×</span>
+      </label>
+    </div>
+
+    <div class="compare-result" id="compare-result" hidden>
+      <div class="compare-verdict">
+        <span class="verdict-word" id="cmp-word">—</span>
+        <span class="verdict-sub" id="cmp-sub"></span>
+      </div>
+      <div class="compare-shots">
+        <figure class="shot"><img id="cmp-ref" alt="Reference image"><figcaption>Reference</figcaption></figure>
+        <figure class="shot"><img id="cmp-cur" alt="Current image, aligned to the reference"><figcaption>Current, aligned</figcaption></figure>
+        <figure class="shot"><img id="cmp-overlay" alt="Differences highlighted on the current image"><figcaption>Differences</figcaption></figure>
+      </div>
+      <dl class="stats" id="cmp-stats"></dl>
+    </div>
+  </section>
+
   <!-- ===================== INPUT ===================== -->
-  <section class="grid-2">
+  <section class="grid-2" id="inspect">
 
     <div class="panel">
       <h2 class="panel-title">Inspect an image</h2>
