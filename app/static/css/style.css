@@ -614,3 +614,37 @@ main { padding: 1.75rem 0 3rem; }
    the brightest thing on screen, which a light ground cannot deliver. Colours
    are therefore painted explicitly rather than inherited from the viewer's
    theme, and no light variant is provided. */
+
+/* ------------------------------------------------------------ compare mode */
+.compare .compare-inputs { margin-top: 14px; }
+.dz-thumbs {
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 10px;
+}
+.dz-thumbs:empty { display: none; }
+.dz-thumbs img {
+  width: 64px; height: 64px; object-fit: cover;
+  border-radius: var(--radius-s); border: 1px solid var(--border-strong);
+}
+.compare-result { margin-top: 20px; }
+.compare-verdict {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 14px; margin-bottom: 14px;
+}
+.compare-verdict .verdict-word.is-normal { color: var(--ok); }
+.compare-verdict .verdict-word.is-anom   { color: var(--danger); }
+.compare-shots {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px;
+  margin-bottom: 16px;
+}
+.compare-shots img {
+  display: block; width: 100%; height: auto; border-radius: var(--radius-s);
+  background: var(--bg-sunken);
+}
+@media (max-width: 760px) {
+  .compare-shots { grid-template-columns: 1fr; }
+}
+.sensitivity {
+  display: inline-flex; align-items: center; gap: 10px; margin-left: auto;
+  font-size: .8rem; color: var(--text-muted);
+}
+.sensitivity input { accent-color: var(--accent); width: 140px; }
+.sensitivity span { font-family: var(--mono); min-width: 3.4em; }
