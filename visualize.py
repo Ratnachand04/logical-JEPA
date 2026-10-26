@@ -501,6 +501,15 @@ def main() -> None:
                 logger.warning("no calibration.json found -- run evaluate.py first for "
                                "meaningful NORMAL/ANOMALOUS verdicts")
 
+            if scorer.uses_memory:
+                # The memory channel scores against the bank evaluate.py saved.
+                bank_path = os.path.join(os.path.dirname(args.checkpoint), "memory_bank.pt")
+                if not (os.path.isfile(bank_path) and scorer.calibration.mem_stats):
+                    raise SystemExit("anomaly.memory is on but no memory bank is saved beside "
+                                     "the checkpoint -- run evaluate.py on it first.")
+                scorer.load_memory_bank(torch.load(bank_path, weights_only=True), device)
+                logger.info(f"loaded memory bank from {bank_path}")
+
             indices = _pick_samples(test_set, args.num, args.defect)
             path = visualize_grid(
                 model, scorer, test_set, indices,
